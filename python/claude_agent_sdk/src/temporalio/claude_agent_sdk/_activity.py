@@ -27,10 +27,8 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import (
-    AbstractAsyncContextManager,
     AsyncExitStack,
     asynccontextmanager,
-    nullcontext,
     suppress,
 )
 from dataclasses import dataclass, field, replace
@@ -96,13 +94,17 @@ from temporalio.claude_agent_sdk._native import (
     NATIVE_TOOLS_VERIFIED,
     REMOTE_CREDENTIAL_ENV,
     NativeToolHooks,
+    answer_call,
+    content_blocks,
     ledger,
     merge_native_calls,
     native_calls,
     native_tools_refusal,
     prepare_state,
     record_native_finished,
+    result_entry,
     sandbox_settings,
+    settle_local_transcript,
 )
 from temporalio.claude_agent_sdk._native import (
     NATIVE_STATE_DIR_NAME as _NATIVE_STATE_DIR_NAME,
@@ -127,6 +129,7 @@ from temporalio.claude_agent_sdk.sandbox import (
     push_state,
     sandbox_hook_command,
     sandbox_state_dir,
+    settle_sandbox_transcript,
 )
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
@@ -149,6 +152,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FALLBACK_HEARTBEAT_INTERVAL = timedelta(seconds=10)
+CANCEL_LATENCY = timedelta(seconds=1)
+"""How soon a running turn hears of a cancellation. Temporal delivers an Activity's cancellation
+only in a heartbeat response, and the SDK throttles heartbeats to 80% of the heartbeat timeout
+(24 s for 30 s), so the turn heartbeats this often and ``ClaudeAgentPlugin`` caps the worker's
+``max_heartbeat_throttle_interval`` at the same value."""
 _KILL_GRACE_SECONDS = 2.0
 _SANDBOX_STATE_TIMEOUT_SECONDS = 20.0
 
@@ -218,6 +226,10 @@ class ClaudeTurnActivity:
             that never returns holds the turn open. Delivery is as advisory as the topic's: a
             retried or resumed attempt sends its partials again under a new ``attempt_id``. An
             exception from the sink is logged and the turn continues.
+        require_seccomp_helper: On Linux, refuse native tools unless sandbox-runtime's seccomp
+            helper is installed globally at ``SANDBOX_RUNTIME_PIN``. ``False`` is an explicit
+            opt-out: Bash's sandbox then lacks that filter, and the worker logs a warning. No
+            effect on macOS or with a ``sandbox``.
     """
 
     def __init__(
@@ -235,6 +247,7 @@ class ClaudeTurnActivity:
         native_env_denylist: Sequence[str] = DEFAULT_NATIVE_ENV_DENYLIST,
         sandbox: SandboxRuntime | None = None,
         partial_sink: PartialSink | None = None,
+        require_seccomp_helper: bool = True,
     ) -> None:
         """Store worker-side configuration. See the class docstring for parameters."""
         if sandbox is not None and (
@@ -247,6 +260,17 @@ class ClaudeTurnActivity:
         self._sandbox = sandbox
         self._partial_sink = partial_sink
         self._enable_native_tools = enable_native_tools
+        self._require_seccomp_helper = require_seccomp_helper
+        if (
+            enable_native_tools
+            and not require_seccomp_helper
+            and sandbox is None
+            and sys.platform.startswith("linux")
+        ):
+            logger.warning(
+                "require_seccomp_helper=False: native Bash on this worker runs without "
+                "sandbox-runtime's seccomp filter"
+            )
         self._native_env_denylist = tuple(native_env_denylist)
         self._session_store = session_store
         self._workspace_store = workspace_store
@@ -300,6 +324,7 @@ class ClaudeTurnActivity:
             sdk_version=sdk.__version__,
             cli=cli,
             in_sandbox=self._sandbox is not None,
+            require_seccomp_helper=self._require_seccomp_helper,
         ):
             _reject(refusal)
         if (
@@ -354,7 +379,7 @@ class ClaudeTurnActivity:
         async with (
             _leased(self._lease_store, input, group, progress) as lease,
             _heartbeat(progress.details),
-            _bridge(input) as bridge,
+            _bridge(input, progress) as bridge,
             _sandbox_turn(self._sandbox, input, lease, resumable) as sandbox,
         ):
             group.remote = sandbox.kill if sandbox is not None else None
@@ -384,7 +409,13 @@ class ClaudeTurnActivity:
             ):
                 _reject(refusal)
             if bridge is not None:
-                bridge.number(input.tool_ordinals or {}, plan.prior)
+                bridge.number(
+                    input.tool_ordinals or {},
+                    plan.prior,
+                    input.tool_calls,
+                    plan.answered,
+                )
+            await self._answer_dangling(input, plan, bridge, lease)
             if launcher is not None:
                 group.path = self._pgid_file(input.session_id, lease)
                 # Before the files and the state are rewritten: a leftover CLI still writes them.
@@ -394,15 +425,19 @@ class ClaudeTurnActivity:
             if state_dir is not None:
                 deny_dirs: list[PurePath] = []
                 if remote_state:
+                    assert sandbox is not None
                     assert self._sandbox is not None and input.session_id is not None
                     session_dir = PurePosixPath(self._sandbox.cwd(input.session_id))
                     deny_dirs += [
                         PurePosixPath(remote_state).parent,
                         session_dir / ".git",
                     ]
-                    # Every session's transcripts, when the runtime moves them off ``~/.claude``.
-                    runtime_env = getattr(self._sandbox, "env", None) or {}
-                    if config := runtime_env.get("CLAUDE_CONFIG_DIR"):
+                    # Every session's transcripts.
+                    try:
+                        config = await sandbox.config_dir()
+                    except SandboxLost as exc:  # before the CLI started: nothing ran
+                        raise _sandbox_lost(exc, input, 0, resumable) from exc
+                    if config is not None:
                         deny_dirs.append(PurePosixPath(config))
                 else:
                     deny_dirs.append(state_dir.parent)
@@ -423,10 +458,14 @@ class ClaudeTurnActivity:
                     pull=pull,
                     tools=cli_tools(input),
                 )
+            # The ledger is the previous run's until prepare_state deletes it.
+            prepared = False
             try:
                 try:
+                    input = await self._settle_transcript(input, sandbox, cwd, lease)
                     if state_dir is not None:
                         prepare_state(state_dir, input)
+                        prepared = True
                         if sandbox is not None and remote_state is not None:
                             try:
                                 # The snapshot's ledger is the record of effects the workflow
@@ -470,7 +509,10 @@ class ClaudeTurnActivity:
                                 _untracked(
                                     "the launcher recorded no process group for the CLI"
                                 )
-                            await client.query(_prompt(plan.prompt, plan.prompt_uuid))
+                            if not _resumes_approved_call(input):
+                                await client.query(
+                                    _prompt(plan.prompt, plan.prompt_uuid)
+                                )
                             result = await _consume(
                                 client,
                                 mirror_errors,
@@ -480,9 +522,14 @@ class ClaudeTurnActivity:
                             )
                         except asyncio.CancelledError:
                             if bridge is not None:
-                                # Answer the CLI's in-flight tool calls before interrupting it.
+                                # Ordinary cancellation unblocks calls before interrupting.
                                 bridge.close("the turn was cancelled")
-                            await self._interrupt_and_drain(client)
+                            if bridge is not None and bridge.failure is not None:
+                                _kill(group.pgid, _cli_process(client))
+                                if group.remote is not None:
+                                    group.remote()
+                            else:
+                                await self._interrupt_and_drain(client, progress)
                             raise
                         except SandboxLost as exc:
                             lost_sandbox = exc
@@ -522,6 +569,8 @@ class ClaudeTurnActivity:
                         progress.num_turns,
                         resumable,
                         native_calls=progress.native_calls(),
+                        cost_usd=progress.cost_usd,
+                        cumulative_cost=progress.cumulative_cost,
                         ledger_unreadable=sandbox is not None
                         and sandbox.ledger_unreadable,
                     ) from exc
@@ -556,11 +605,15 @@ class ClaudeTurnActivity:
                     "sandbox_snapshot": snapshot,
                     "session_store": self._session_store is not None,
                     # A failed run's re-requests still count against the session's cap.
-                    "native_rerequests": _rerequests(state_dir),
+                    "native_rerequests": _rerequests(state_dir if prepared else None),
                 }
-                if sandbox is not None and sandbox.ledger_unreadable:
+                if sandbox is not None:
+                    # The snapshot holds this run's transcript, and a sandboxed attempt does not
+                    # plan from it: a new session over it is refused as in use, and a resumed one
+                    # would be sent the prompt again.
                     payload[RESUMABLE_DETAIL] = False
-                    payload["sandbox_snapshot"] = None
+                    if sandbox.ledger_unreadable:
+                        payload["sandbox_snapshot"] = None
                 tail = _stderr_tail(stderr)
                 if tail:
                     payload["stderr_tail"] = tail
@@ -590,6 +643,8 @@ class ClaudeTurnActivity:
                     num_turns=result.num_turns,
                     cumulative_cost=progress.cumulative_cost,
                     native_rerequests=_rerequests(state_dir),
+                    # Calls the missing snapshot does not hold stay started.
+                    native_calls=progress.native_calls(),
                 )
                 raise
         return _to_turn_result(
@@ -602,6 +657,49 @@ class ClaudeTurnActivity:
             progress.sandbox_violations,
             progress.cumulative_cost,
         )
+
+    async def _settle_transcript(
+        self,
+        input: ClaudeTurnInput,
+        sandbox: SandboxTurn | None,
+        cwd: Path | None,
+        lease: Lease | None,
+    ) -> ClaudeTurnInput:
+        """Settle answered deferrals in the transcript a resumed CLI reads, after answering a
+        settling decision's call there; return the input without that decision.
+
+        See ``_native.settle_answered_deferrals``. A SessionStore's copy is settled on load. A
+        settled call has its result before the CLI starts, so the CLI has nothing deferred to
+        re-present and the run is an ordinary turn on the message's prompt. The answer is
+        written once: a retried attempt that finds it writes nothing more.
+        """
+        decision = input.native_decision
+        answer = (
+            (decision.call.tool_use_id, decision.reason or "")
+            if decision is not None and decision.settle
+            else None
+        )
+        session_id = input.session_id
+        if not input.resume or session_id is None:
+            return input
+        if sandbox is not None and self._sandbox is not None:
+            await settle_sandbox_transcript(
+                sandbox.sandbox, self._sandbox.cwd(session_id), session_id, answer
+            )
+        elif self._session_store is None and cwd is not None:
+            await asyncio.to_thread(
+                settle_local_transcript, _local_transcript(cwd, session_id), answer
+            )
+        elif answer is not None and cwd is not None:
+            key = {
+                "project_key": load_sdk().project_key_for_directory(cwd),
+                "session_id": session_id,
+            }
+            store = fenced_session_store(self._session_store, lease)
+            entries = await store.load(key) or []  # type: ignore[arg-type]
+            if entry := answer_call(entries, *answer):  # type: ignore[arg-type]
+                await store.append(key, [entry])  # type: ignore[arg-type]
+        return input.model_copy(update={"native_decision": None}) if answer else input
 
     async def _restore_workspace(
         self, input: ClaudeTurnInput, cwd: Path | None
@@ -752,14 +850,20 @@ class ClaudeTurnActivity:
             ),
             None,
         )
+        stored = _harness_calls(entries)  # type: ignore[arg-type]
+        answered = frozenset(call_id for call_id, _, done in stored if done)
         if at is not None:
             return _Plan(
                 resume=True,
                 prompt=CONTINUE_PROMPT,
                 prior=_harness_calls(entries[at + 1 :]),  # type: ignore[arg-type]
+                dangling=_dangling_calls(entries[at + 1 :]),  # type: ignore[arg-type]
+                answered=answered,
             )
+        # A settled call belongs to an earlier message: this run is that message's successor.
+        decision = input.native_decision
         decided = (
-            input.native_decision.call.tool_use_id if input.native_decision else None
+            decision.call.tool_use_id if decision and not decision.settle else None
         )
         after = next(
             (
@@ -773,11 +877,62 @@ class ClaudeTurnActivity:
             ),
             None,
         )
+        # A run that resumes a decided native call has no prompt entry (the CLI writes its own
+        # "Continue"), so its calls are the ones from the decided call's message on.
         return replace(
             plan,
             resume=True,
             prior=_harness_calls(entries[after + 1 :]) if after is not None else [],  # type: ignore[arg-type]
+            dangling=_dangling_calls(entries[after:]) if after is not None else [],  # type: ignore[arg-type]
+            answered=answered,
         )
+
+    async def _answer_dangling(
+        self,
+        input: ClaudeTurnInput,
+        plan: _Plan,
+        bridge: ToolBridgeClient | None,
+        lease: Lease | None,
+    ) -> None:
+        """Answer, in the stored transcript, each workflow-tool call a lost attempt left without
+        a result, before the CLI starts.
+
+        The resumed CLI would patch such a call as interrupted with an unknown outcome, and a
+        model told that may never ask again, losing a pending approval. The workflow knows the
+        call: asking it under the call's own id attaches to the record (a running call is not
+        run again) or runs a call that never reached it once. The answers are appended as the
+        CLI writes a result, under the lease, so the resumed CLI sees finished calls.
+        """
+        cwd = self._workspace(input.session_id)
+        if (
+            bridge is None
+            or not plan.dangling
+            or self._session_store is None
+            or cwd is None
+        ):
+            return
+        prefix = mcp_tool_name("")
+        results = await asyncio.gather(
+            *(
+                bridge.call(
+                    block["id"],
+                    block["name"].removeprefix(prefix),
+                    block.get("input") or {},
+                )
+                for _, block in plan.dangling
+            )
+        )
+        if bridge.closed:
+            return  # the CLI patches them, as without this step
+        key = {
+            "project_key": load_sdk().project_key_for_directory(cwd),
+            "session_id": input.session_id,
+        }
+        answers = [
+            result_entry(entry, result)
+            for (entry, _), result in zip(plan.dangling, results, strict=True)
+        ]
+        await fenced_session_store(self._session_store, lease).append(key, answers)  # type: ignore[arg-type]
 
     def _workspace(self, session_id: str | None) -> Path | None:
         """The session's working directory, created on first use; none without a session."""
@@ -940,8 +1095,11 @@ class ClaudeTurnActivity:
             env=env,
         )
 
-    async def _interrupt_and_drain(self, client: ClaudeSDKClient) -> None:
-        """Stop the run and read its final result so the transcript records the interruption.
+    async def _interrupt_and_drain(
+        self, client: ClaudeSDKClient, progress: _Progress
+    ) -> None:
+        """Stop the run and read its final result so the transcript records the interruption,
+        then report the spend it showed: a cancelled Activity returns no result to carry it.
 
         Best effort: cancellation can land before connect finished (interrupt then raises), and a
         wedged CLI must not hold the Activity open, so every step is bounded and failures are only
@@ -951,10 +1109,13 @@ class ClaudeTurnActivity:
             async with asyncio.timeout(self._interrupt_timeout):
                 await client.interrupt()
             async with asyncio.timeout(self._drain_timeout):
-                async for _message in client.receive_response():
-                    pass
+                async for message in client.receive_response():
+                    if (cost := _reported_cost(message)) is not None:
+                        progress.cost_usd = cost
         except Exception as exc:  # noqa: BLE001 - cleanup must reach disconnect
             logger.warning("Claude interrupt/drain after cancellation failed: %r", exc)
+        if progress.cost_usd:
+            await progress.report(spent=True)
 
     async def _disconnect(self, client: ClaudeSDKClient, group: _CliGroup) -> None:
         """Disconnect within the bound, else kill the CLI by this attempt's own process group
@@ -1000,13 +1161,17 @@ class ClaudeTurnActivity:
 @dataclass(frozen=True)
 class _Plan:
     """What :meth:`ClaudeTurnActivity._plan` decided: resume or start, the prompt and the uuid it
-    is sent with, and the run's harness calls already in the store (see :func:`_harness_calls`).
+    is sent with, the run's harness calls already in the store (see :func:`_harness_calls`),
+    those with no result at all (see :func:`_dangling_calls`), and the ids of every harness call
+    the whole stored transcript answers (none when no stored transcript was read).
     """
 
     resume: bool
     prompt: str
     prompt_uuid: str | None = None
-    prior: list[tuple[str, bool]] = field(default_factory=list)
+    prior: list[tuple[str, str, bool]] = field(default_factory=list)
+    answered: frozenset[str] | None = None
+    dangling: list[tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=list)
 
 
 async def _prompt(text: str, prompt_uuid: str | None) -> AsyncIterator[dict[str, Any]]:
@@ -1062,6 +1227,24 @@ def _cli_schema(node: Any) -> Any:
     return out
 
 
+def _resumes_approved_call(input: ClaudeTurnInput) -> bool:
+    """Whether this run exists only to run a call the workflow approved.
+
+    The CLI then starts a turn of its own ("Continue from where you left off"), and a prompt
+    sent as well is queued behind it: 2.1.294 answers it right after the next deferral, so that
+    deferral is ignored and the model goes on (anthropics/claude-code#97196). A retry of a lost
+    attempt, or a call the ledger already holds (the CLI has nothing to resume), still needs its
+    prompt.
+    """
+    decision = input.native_decision
+    return (
+        decision is not None
+        and decision.approved
+        and not input.resumes_lost_attempt
+        and all(c.tool_use_id != decision.call.tool_use_id for c in input.native_calls)
+    )
+
+
 def _local_transcript(cwd: Path, session_id: str) -> Path:
     """Where the CLI on this worker writes the session's transcript."""
     config = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
@@ -1099,9 +1282,9 @@ def _reported_cost(message: Any) -> float | None:
     return float(cost) if isinstance(cost, int | float) else None
 
 
-def _harness_calls(entries: list[dict[str, Any]]) -> list[tuple[str, bool]]:
-    """Harness tool calls in ``entries`` in order, by :func:`tool_call_key`, each with whether
-    it has a real result.
+def _harness_calls(entries: list[dict[str, Any]]) -> list[tuple[str, str, bool]]:
+    """Harness tool calls in ``entries`` in order, by id and :func:`tool_call_key`, each with
+    whether it has a real result.
     """
     prefix = mcp_tool_name("")
     calls = {
@@ -1110,7 +1293,7 @@ def _harness_calls(entries: list[dict[str, Any]]) -> list[tuple[str, bool]]:
         )
         for entry in entries
         if entry.get("type") == "assistant"
-        for block in _blocks(entry)
+        for block in content_blocks(entry)
         if block.get("type") == "tool_use"
         and str(block.get("name", "")).startswith(prefix)
     }
@@ -1118,18 +1301,36 @@ def _harness_calls(entries: list[dict[str, Any]]) -> list[tuple[str, bool]]:
         block.get("tool_use_id")
         for entry in entries
         if entry.get("type") == "user"
-        for block in _blocks(entry)
+        for block in content_blocks(entry)
         if block.get("type") == "tool_result"
         and not _result_text(block.get("content")).startswith(_INTERRUPTED_RESULT)
     }
-    return [(key, call_id in answered) for call_id, key in calls.items()]
+    return [(call_id, key, call_id in answered) for call_id, key in calls.items()]
 
 
-def _blocks(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    content = (entry.get("message") or {}).get("content")
-    return (
-        [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
-    )
+def _dangling_calls(
+    entries: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Harness ``tool_use`` blocks in ``entries`` that no ``tool_result`` answers (an
+    interrupted patch counts as one), each with the assistant entry that holds it.
+    """
+    prefix = mcp_tool_name("")
+    answered = {
+        block.get("tool_use_id")
+        for entry in entries
+        if entry.get("type") == "user"
+        for block in content_blocks(entry)
+        if block.get("type") == "tool_result"
+    }
+    return [
+        (entry, block)
+        for entry in entries
+        if entry.get("type") == "assistant"
+        for block in content_blocks(entry)
+        if block.get("type") == "tool_use"
+        and str(block.get("name", "")).startswith(prefix)
+        and block.get("id") not in answered
+    ]
 
 
 def _result_text(content: Any) -> str:
@@ -1387,23 +1588,51 @@ async def _consume(
             type=CLAUDE_RESULT_ERROR_TYPE,
             non_retryable=True,
         )
+    # A resumed CLI's num_turns grows with the transcript (35, 42, 49 ... for runs with one model
+    # call), and the message-wide max_turns sums per-run counts: report this run's rounds.
+    result = replace(result, num_turns=len(rounds))
     if result.is_error:
         raise _result_error(result, mirror_errors, resets_at, error_kind)
     return result
 
 
-def _bridge(
-    input: ClaudeTurnInput,
-) -> AbstractAsyncContextManager[ToolBridgeClient | None]:
+@asynccontextmanager
+async def _bridge(
+    input: ClaudeTurnInput, progress: _Progress
+) -> AsyncIterator[ToolBridgeClient | None]:
     """The turn's tool bridge back to the workflow that scheduled it, or none without tools."""
     if not (input.tools and input.bridge_token):
-        return nullcontext()
-    return ToolBridgeClient(
+        yield None
+        return
+    async with ToolBridgeClient(
         activity.client().get_workflow_handle(
             activity.info().workflow_id  # type: ignore[arg-type]
         ),
         input.bridge_token,
-    )
+    ) as bridge:
+        body = asyncio.current_task()
+        assert body is not None
+
+        async def supervise() -> None:
+            await bridge.wait_failure()
+            body.cancel()
+
+        supervisor = asyncio.create_task(supervise())
+        try:
+            yield bridge
+        except asyncio.CancelledError as exc:
+            if bridge.failure is None:
+                raise
+            body.uncancel()
+            raise ApplicationError(
+                f"Claude tool outcome unknown: {bridge.failure}. The CLI was stopped.",
+                {"session_id": input.session_id, **progress.details(lost=False)},
+                type=CLAUDE_RESULT_ERROR_TYPE,
+                non_retryable=True,
+            ) from exc
+        finally:
+            supervisor.cancel()
+            await asyncio.gather(supervisor, return_exceptions=True)
 
 
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -1767,13 +1996,17 @@ class _Progress:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def report(self) -> None:
+    async def report(self, *, spent: bool = False) -> None:
+        """Signal what changed; ``spent`` (once, from a cancelled attempt) adds its cost."""
         if not self._input.report_progress or self._input.session_id is None:
             return
         async with self._lock:
             calls = self.native_calls()
             mirror_errors = list(self.mirror_errors)
-            if (calls, self.workspace_revision, mirror_errors) == self._reported:
+            if (
+                not spent
+                and (calls, self.workspace_revision, mirror_errors) == self._reported
+            ):
                 return
             progress = ClaudeTurnProgress(
                 session_id=self._input.session_id,
@@ -1781,6 +2014,8 @@ class _Progress:
                 native_calls=calls,  # type: ignore[arg-type]
                 workspace_revision=self.workspace_revision,
                 mirror_errors=mirror_errors,
+                cost_usd=self.cost_usd if spent else None,
+                cumulative_cost=spent and self.cumulative_cost,
             )
             try:
                 handle = activity.client().get_workflow_handle(
@@ -1805,10 +2040,10 @@ async def _persist(
 async def _heartbeat(
     details: Callable[[], dict[str, Any]] | None,
 ) -> AsyncIterator[None]:
-    """Heartbeat at half the heartbeat timeout for the whole block, independent of token flow,
-    so a long silent model round never looks like a dead worker and cancellation is delivered.
-    ``details()`` rides every heartbeat: a workflow reads it from the heartbeat timeout of an
-    attempt whose worker died.
+    """Heartbeat every ``CANCEL_LATENCY`` (at most half the heartbeat timeout) for the whole
+    block, independent of token flow, so a long silent model round never looks like a dead
+    worker and a cancellation is delivered fast. ``details()`` rides every heartbeat: a workflow
+    reads it from the heartbeat timeout of an attempt whose worker died.
 
     With no ``details`` (setup before the attempt has any) the beats are bare and the first
     waits one interval, so a quick block sends none: the attempt's first heartbeat, the only one
@@ -1816,7 +2051,7 @@ async def _heartbeat(
     an attempt that never started.
     """
     timeout = activity.info().heartbeat_timeout or 2 * _FALLBACK_HEARTBEAT_INTERVAL
-    interval = timeout.total_seconds() / 2
+    interval = min(timeout.total_seconds() / 2, CANCEL_LATENCY.total_seconds())
 
     async def beat() -> None:
         if details is None:
@@ -1954,17 +2189,22 @@ def _sandbox_lost(
     *,
     native_calls: list[dict[str, Any]] | None = None,
     ledger_unreadable: bool = False,
+    cost_usd: float = 0.0,
+    cumulative_cost: bool = False,
 ) -> ApplicationError:
     """The error for a turn whose sandbox was lost. The workflow resumes it from the last
     committed snapshot only when ``resumable`` (a shared lease store) is set and the native
-    effect is safe to retry. The details name no new snapshot. An unreadable ledger is reported
-    and does not by itself clear that flag.
+    effect is safe to retry. The details name no new snapshot, and the spend the CLI had
+    reported, which the session pays. An unreadable ledger is reported and does not by itself
+    clear that flag.
     """
     details: dict[str, Any] = {
         "session_id": input.session_id,
         "num_turns": num_turns,
         "sandbox_snapshot": None,
         RESUMABLE_DETAIL: resumable,
+        "cost_usd": cost_usd,
+        "cumulative_cost": cumulative_cost,
     }
     if native_calls is not None:
         details["native_calls"] = native_calls

@@ -32,15 +32,17 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from temporalio.claude_agent_sdk._native import settle_answered_deferrals
 from temporalio.claude_agent_sdk._sdk import load_sdk
 
 logger = logging.getLogger(__name__)
@@ -109,7 +111,8 @@ class FileLeaseStore:
 
     A claim writes the whole record to a temp file and ``os.link``s it to the generation's
     name, which fails if the name exists, so no reader sees a partial record and no claim
-    replaces another. A beat is written to a temp file and ``os.replace``d over the holder's own
+    replaces another. On Windows it renames the temp file instead, which never replaces an
+    existing name there either. A beat is written to a temp file and ``os.replace``d over the holder's own
     beat file.
 
     Multi-worker use needs ``root`` on a filesystem every worker mounts with POSIX semantics for
@@ -172,7 +175,9 @@ class FileLeaseStore:
         tmp = path / f".{uuid.uuid4().hex}.tmp"
         tmp.write_text(json.dumps({"owner": owner, "generation": generation}))
         try:
-            os.link(tmp, target)
+            # Windows cannot delete the temp name of a linked record while a loser reads the
+            # record (sharing is per file, not per name), so it renames instead.
+            (os.rename if sys.platform == "win32" else os.link)(tmp, target)
         except FileExistsError:
             # Ours anyway if the link landed and only its reply was lost (NFS retransmission).
             try:
@@ -187,13 +192,13 @@ class FileLeaseStore:
         # A slow contender can link a generation a newer claim already pruned; the newest
         # generation is never pruned, so seeing one above ours means we lost.
         if any(n.isdigit() and int(n) > generation for n in names):
-            target.unlink(missing_ok=True)
+            _discard(target)
             return False
         # Older generations are read by no one now; a stale holder still checking finds ours.
         for name in names:
             stem = name.split(".", 1)[0]
             if stem.isdigit() and int(stem) < generation:
-                (path / name).unlink(missing_ok=True)
+                _discard(path / name)
         return True
 
     def beat(
@@ -214,6 +219,14 @@ class FileLeaseStore:
 
 def _name(generation: int) -> str:
     return f"{generation:012d}"
+
+
+def _discard(path: Path) -> None:
+    # Windows refuses to delete a file another process has open. Only generations below the
+    # newest are discarded; one left behind is never chosen by `latest`, and the next claim
+    # prunes it.
+    with suppress(PermissionError):
+        path.unlink(missing_ok=True)
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -440,7 +453,9 @@ async def _acquire(
 
 def fenced_session_store(store: Any, lease: Lease | None) -> Any:
     """``store`` with every ``append`` refused once ``lease`` is no longer the session's newest
-    generation, so a CLI that was taken over cannot keep mirroring into the transcript.
+    generation, so a CLI that was taken over cannot keep mirroring into the transcript, and every
+    ``load`` passed through ``_native.settle_answered_deferrals`` (the stored copy is unchanged).
+    Without a lease only the second applies.
 
     A check-then-append, not an atomic one: SessionStore (SDK 0.2.165) has no conditional write
     to carry the generation into, so an append that passed its check still lands if a takeover
@@ -449,8 +464,8 @@ def fenced_session_store(store: Any, lease: Lease | None) -> Any:
     The SDK probes optional methods on the store's CLASS (``_store_implements``), so the wrapper
     class only defines the ones ``store`` really implements.
     """
-    if store is None or lease is None:
-        return store
+    if store is None:
+        return None
     base: Any = type(store)
     protocol = load_sdk().SessionStore
     methods: dict[str, Any] = {
@@ -467,16 +482,18 @@ def fenced_session_store(store: Any, lease: Lease | None) -> Any:
 
 
 class _Fenced:
-    def __init__(self, inner: Any, lease: Lease) -> None:
+    def __init__(self, inner: Any, lease: Lease | None) -> None:
         self._inner = inner
         self._lease = lease
 
     async def append(self, key: Any, entries: list[Any]) -> None:
-        await self._lease.check()
+        if self._lease is not None:
+            await self._lease.check()
         await self._inner.append(key, entries)
 
     async def load(self, key: Any) -> Any:
-        return await self._inner.load(key)
+        entries = await self._inner.load(key)
+        return settle_answered_deferrals(entries) if entries else entries
 
 
 def _delegate(name: str) -> Callable[..., Any]:
