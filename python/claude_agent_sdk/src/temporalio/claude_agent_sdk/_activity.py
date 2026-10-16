@@ -784,6 +784,7 @@ class ClaudeTurnActivity:
             return None
         try:
             snapshot = await sandbox.snapshot()
+            progress.sandbox_snapshot = snapshot
             progress.settle_snapshotted()
             return snapshot
         except SandboxError as exc:
@@ -1887,6 +1888,7 @@ class _Progress:
         self.error_kind: str | None = None
         self.sandbox_violations = 0
         self.workspace_revision = input.workspace_revision
+        self.sandbox_snapshot = input.sandbox_snapshot
         self.mirror_errors = mirror_errors
         self.lease: Lease | None = None
         self._input = input
@@ -1922,7 +1924,7 @@ class _Progress:
             "cumulative_cost": self.cumulative_cost,
             "error_kind": self.error_kind,
             "workspace_revision": self.workspace_revision,
-            "sandbox_snapshot": self._input.sandbox_snapshot,
+            "sandbox_snapshot": self.sandbox_snapshot,
             "native_calls": self.native_calls(),
             "mirror_errors": list(self.mirror_errors),
             "lease": [self.lease.generation, self.lease.beat] if self.lease else None,
