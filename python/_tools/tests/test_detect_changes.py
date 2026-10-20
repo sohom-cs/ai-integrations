@@ -12,7 +12,7 @@ def _setup(repo: Path) -> str:
     make_python_plugin(repo, "beta")
     (repo / "python" / "_shared").mkdir(parents=True)
     (repo / "python" / "_shared" / "BUILD.bazel").write_text("all:\n")
-    (repo / "python" / "README.md").write_text("python\n")
+    (repo / "python" / "BUILD.bazel").write_text("# Language build targets\n")
     ts = repo / "typescript" / "gamma"
     ts.mkdir(parents=True)
     (ts / "package.json").write_text("{}")
@@ -52,7 +52,7 @@ def test_plugin_file_selects_only_that_plugin(repo: Path, path: str) -> None:
 
 def test_shared_language_file_selects_all_plugins_of_that_language(repo: Path) -> None:
     base = _setup(repo)
-    assert _run(repo, base, "python/README.md")["python"] == ["alpha", "beta"]
+    assert _run(repo, base, "python/BUILD.bazel")["python"] == ["alpha", "beta"]
     assert _run(repo, base, "python/_shared/BUILD.bazel")["python"] == ["alpha", "beta"]
     assert _run(repo, base, "python/_shared/BUILD.bazel")["typescript"] == []
 

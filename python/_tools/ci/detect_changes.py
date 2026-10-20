@@ -3,7 +3,7 @@
 
 Stdlib only (runs with the runner's system python3 before uv is installed).
 
-Rules (see AGENTS.md, "CI architecture"):
+Selection rules:
   * push to main, schedule, workflow_dispatch, FORCE_ALL, unknown events, or an
     unusable diff base           -> every plugin of every language
   * .github/**, bazel/** and root Bazel configuration -> every plugin
@@ -82,7 +82,7 @@ def select(
                 selected[top].update(plugins[top])
             other_touched = True
             continue
-        # Other root-level files (README.md, AGENTS.md, ...) select nothing.
+        # Other root-level documentation files select nothing.
     return (
         selected,
         False,

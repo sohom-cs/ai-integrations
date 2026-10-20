@@ -1,8 +1,8 @@
-# AGENTS.md — temporalio/ai-integrations
+# Repository guide — temporalio/ai-integrations
 
-Normative guide for humans and coding agents working in this repository. Other documents
-(`README.md`, `CONTRIBUTING.md`, `python/README.md`) are short and
-link here. Design source: the
+Normative guide for humans and coding agents working in this repository. This file covers
+contributing, Bazel development, language conventions, CI and releases. The root and plugin
+READMEs cover installation and usage. Design source: the
 [ai-integrations design doc](https://app.notion.com/p/temporalio/ai-integrations-3ca8fc5677388120b5c3cf5567f0327c).
 
 ## Do not
@@ -82,6 +82,83 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - No changelog files. `bazel run //<language>/_tools:release -- release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
 
+## Contributing
+
+PRs are squash-merged. Issue and PR templates are the organization defaults from
+`temporalio/.github`. CI selects affected plugins; the required checks and code-owner review
+are described under [CI](#ci).
+
+All contributors must complete the Temporal Contributor License Agreement (CLA) before
+changes can be merged. A link to the CLA is posted in the pull request.
+
+## Bazel development
+
+Install [Bazelisk](https://github.com/bazelbuild/bazelisk). Run commands from the repository
+root; `.bazelversion` pins Bazel, which downloads the pinned language toolchains.
+
+```bash
+bazel test //...
+bazel build //python/mcp:dist
+bazel test //typescript/google-adk:tests //typescript/google-adk:lint
+bazel test //java/spring-ai:tests --config=java17 --//bazel:spring_boot=4.1.1
+bazel test //go/googleadk:tests --config=go126
+```
+
+Every plugin exposes `:build`, `:tests` and `:dist`. Python and TypeScript `:lint` targets
+check formatting and types. Go `:lint` checks formatting; the selected SDK's vet runs with
+`bazel run //go/_tools:lint -- --plugin-dir go/googleadk`. Java formatting uses
+`bazel run //java/_tools:format -- --dry-run --set-exit-if-changed --plugin-dir java/spring-ai`.
+Each language's `_tools/` owns its CI, release validation and artifact checks; run
+`bazel run //<language>/_tools:ci -- conventions` to check that language's conventions.
+
+Python, TypeScript and Java distribution files appear under
+`bazel-bin/<language>/<plugin>/dist/`. Go's `:dist` builds the module; its release is an
+immutable Git tag. Release builds pass `--//bazel:release_version=<version>` without
+modifying committed development versions. CI saves the designated cell's tested bytes
+under the existing release artifact names. Registry integrity, clean consumer installation,
+immutable tags and publication recovery remain release requirements.
+
+### Dependencies and lockfiles
+
+Each plugin owns its native manifest and lock. `python/_deps.MODULE.bazel`,
+`typescript/_deps.MODULE.bazel`, `java/_deps.MODULE.bazel` and `go/_deps.MODULE.bazel` expose
+independent graphs. Cross-plugin dependencies resolve published packages. Java separately
+locks compilation, test compilation and test runtime for each Spring Boot version.
+`MODULE.bazel.lock` pins the Bazel dependency graph; ordinary builds use
+`--lockfile_mode=error` and preserve committed locks.
+
+Intentional compatible upgrades use the relevant language's developer tool:
+
+```bash
+bazel run //<language>/_tools:dev -- update --plugin-dir <language>/<plugin>
+bazel mod deps --lockfile_mode=update
+```
+
+Review manifest and native lock changes, then the Bazel lock. Maven graphs can be repinned
+explicitly with `REPIN=1 bazel run @<graph>//:pin --lockfile_mode=update`. New plugins also
+declare an independent dependency repository in their language's module fragment. Never
+add a root language workspace to make dependency conflicts disappear. Nightly CI performs
+compatible updates in a disposable checkout, preserving Python and pnpm cooldowns and
+first-party exceptions.
+
+### Test environments and runtimes
+
+Tests use deterministic local provider doubles without provider credentials.
+`bazel/temporal.MODULE.bazel` declares checksum-verified Temporal CLI archives for macOS,
+Linux and Windows, including the pinned Python CLI/server version. Python, TypeScript and
+Go tests receive executable paths through runfiles and provision a local Temporal server.
+Java uses the SDK's in-process test server. The pinned Gradle distribution tests Maven
+consumer installation; plugin builds use Bazel.
+
+Runtime configurations are `py310`, `py311`, `py314`, `node22`, `node24`, `java17`, `java25`,
+`go126` and `go127`. CI retains Ubuntu min/max and macOS/Windows max, plus every Java
+compatibility variant. `.github/actions/setup-bazel` uses commit-scoped caches and only
+saves on trusted main pushes. Optional local settings belong in ignored `user.bazelrc`.
+
+The [Temporal agent harness](https://github.com/temporal-community/temporal-agent-harness/tree/578acdc04c75e3cc6bb91d9985f720265aea3bdf)
+informed the CLI runfiles, runtime configuration and cache setup. This repository retains
+independent package locks, native publication artifacts and Windows coverage.
+
 ## Python conventions
 
 - Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, BUILD.bazel, README.md, LICENSE, src/temporalio/<name>/, tests/}`.
@@ -92,6 +169,22 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). `bazel/python.bzl` owns build and test rules; `python/_shared/` owns composable Pyright/Ruff defaults; mypy and pydocstyle settings stay in each `pyproject.toml` because those tools cannot extend another config while preserving plugin overrides. Use `bazel test //python/<name>:lint //python/<name>:tests` and `bazel build //python/<name>:dist`.
 - Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Bind those options in a startup callback passed to `tests/helpers/environment.py`'s `start_local_with_retry`. This plugin-agnostic policy allows three startup attempts with a one-second delay for the SDK's explicit startup-deadline message; other errors and cancellation propagate immediately.
 - Test scaffolding: each plugin owns its provenance guard, local dev-server fixtures and pytest hooks. New plugins copy the standard implementations from `python/_template/tests/`; the conventions check keeps `environment.py`, `plugin_meta.py`, `provenance.py`, `test_env.py`, and `test_installed_matches_source.py` byte-identical to their canonical templates. Plugin-specific fixtures stay in that plugin's conftest. Tests must not require real provider credentials; use deterministic local models, mock transports, or in-process servers to exercise provider behavior in CI.
+
+For a Python editor environment, run
+`bazel run //python/_tools:dev -- venv --plugin-dir python/mcp`.
+
+### Adding a Python plugin
+
+```bash
+bazel run //python/_tools:new_plugin -- <name> --description "..." --maturity pre-release
+```
+
+The scaffolder copies `python/_template` and prints the remaining manual steps. Declare
+dependencies, generate the plugin's lock, add its independent dependency repository to
+`python/_deps.MODULE.bazel`, and run its lint, tests and distribution targets. Cover provider
+behavior with deterministic local models or transports, and add a row to the plugin table
+in the root README. CI discovers plugins from `plugin.toml`; no workflow edits are needed.
+Configure trusted publishing as described under [Python releases](#python-releases).
 
 ## Java conventions
 
@@ -132,6 +225,20 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   publisher, as described below. No per-plugin workflows or secrets. CI checks
   tarball contents and a clean consumer import.
 
+## Go conventions
+
+- Each `go/<name>/` owns `go.mod`, `go.sum`, `plugin.toml`, `BUILD.bazel`, `README.md`
+  and a regular-file copy of the root MIT `LICENSE`. Module paths are
+  `go.temporal.io/<name>`; dependencies use published module versions.
+- Run `bazel test //go/googleadk:tests //go/googleadk:lint` and
+  `bazel build //go/googleadk:dist`. The formatting target and the `_tools:lint` vet
+  command are described under [Bazel development](#bazel-development).
+- Compatible updates use `bazel run //go/_tools:dev -- update --plugin-dir go/googleadk`,
+  followed by `bazel mod deps --lockfile_mode=update` and review of the module and Bazel locks.
+  Ordinary builds preserve `go.mod` and `go.sum`.
+- Tests use local provider doubles and a provisioned Temporal server. Ubuntu/max CI
+  enables race detection; runtime and platform coverage is described under [CI](#ci).
+
 ## CI
 
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.
@@ -145,8 +252,8 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 
 ## Releases
 
-Release procedures and publication policy belong only in this file. READMEs and
-contributing guides cover installation, usage, and local development.
+Release procedures and publication policy belong only in this file. READMEs cover
+installation and usage; local development is described under [Bazel development](#bazel-development).
 
 Pre-release and Public Preview plugins publish without a required-reviewer approval
 gate in every language. Use the plugin's `maturity`, independently of whether its
@@ -374,5 +481,5 @@ bazel build //python/<name>:dist
 bazel test //python/_tools:tool_tests //typescript/_tools:tool_tests //java/_tools:tool_tests //go/_tools:tool_tests
 bazel run //python/_tools:ci -- conventions
 bazel run //python/_tools:ci -- select --dry-run --base origin/main
-bazel run //python/_tools:check_wheel -- --plugin-dir python/<name> --dist python/<name>/dist
+bazel run //python/_tools:check_wheel -- --plugin-dir python/<name> --dist bazel-bin/python/<name>/dist
 ```

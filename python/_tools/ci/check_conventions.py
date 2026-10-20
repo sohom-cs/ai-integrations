@@ -4,7 +4,7 @@
 Runs on every PR (job `conventions`) and nightly. Exits non-zero
 with a list of violations. Passes on a repository with zero plugins.
 
-Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
+Checks:
   * plugin folder names never end in `-plugin` / `_plugin`
   * no language-level lockfiles (python/uv.lock, typescript/pnpm-lock.yaml, ...)
   * python/_shared contains configuration and Bazel logic, never Python source or stubs

@@ -2,7 +2,6 @@ load("@buildifier_prebuilt//:rules.bzl", "buildifier")
 
 exports_files([
     "LICENSE",
-    "AGENTS.md",
     "MODULE.bazel",
 ])
 
