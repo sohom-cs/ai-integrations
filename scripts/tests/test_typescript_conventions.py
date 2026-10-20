@@ -6,9 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
-
 from _common import Plugin
-from check_conventions import Checker, STANDARD_TYPESCRIPT_TEST_SUPPORT
+from check_conventions import STANDARD_TYPESCRIPT_TEST_SUPPORT, Checker
 from conftest import commit_all
 
 
@@ -26,8 +25,6 @@ coordinate = "@temporalio/fake"
 root-api = "@temporalio/fake"
 registry = "npm"
 maturity = "pre-release"
-[release]
-allow-final = false
 [ci]
 runtime-versions = ["22", "24"]
 [smoke]

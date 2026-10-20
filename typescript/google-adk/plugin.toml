@@ -7,9 +7,6 @@ root-api = "@temporalio/google-adk"
 maturity = "public-preview"
 docs = "https://docs.temporal.io/develop/typescript/integrations/google-adk-agents"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["22", "24"]
 
