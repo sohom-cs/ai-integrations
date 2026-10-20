@@ -5,6 +5,7 @@ import (
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var goRunfile string
@@ -29,7 +30,7 @@ func main() {
 			o[key] = filepath.Join(workspace(), o[key])
 		}
 	}
-	mode := filepath.Base(os.Args[0])
+	mode := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
 	if len(pos) > 0 && (pos[0] == "ci" || pos[0] == "release" || pos[0] == "dev") {
 		mode, pos = pos[0], pos[1:]
 	}

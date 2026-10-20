@@ -53,7 +53,10 @@ py_binary(
 py_test(
     name = "tool_tests",
     size = "large",
-    srcs = ["test_main.py"] + glob(["tests/*.py"]),
+    srcs = [
+        "build_dist.py",
+        "test_main.py",
+    ] + glob(["tests/*.py"]),
     data = [
         "new_python_plugin.py",
         "pyproject.toml",
@@ -61,6 +64,7 @@ py_test(
         "//python:template",
         "//python/_shared:config",
     ],
+    imports = ["."],
     legacy_create_init = False,
     main = "test_main.py",
     python_version = "3.14",
@@ -69,6 +73,7 @@ py_test(
         ":tools",
         "@python_tools//pytest",
         "@python_tools//pyyaml",
+        "@python_tools//uv_build",
     ],
 )
 

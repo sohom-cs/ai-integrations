@@ -1,3 +1,4 @@
+startup --windows_enable_symlinks
 common --incompatible_strict_action_env
 common --incompatible_default_to_explicit_init_py
 common --repo_env=DO_NOT_TRACK=1
@@ -6,6 +7,7 @@ common --@aspect_rules_ts//ts:default_to_tsc_transpiler
 test --test_output=errors
 test --local_test_jobs=4
 build --lockfile_mode=error
+build --enable_runfiles
 common:py310 --@rules_python//python/config_settings:python_version=3.10
 common:py310 --platform_suffix=py310
 common:py311 --@rules_python//python/config_settings:python_version=3.11

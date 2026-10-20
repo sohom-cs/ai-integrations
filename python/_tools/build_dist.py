@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+from contextlib import chdir
 from pathlib import Path
 
 import uv_build
@@ -46,9 +47,9 @@ def main() -> None:
                 count=1,
             )
         )
-        os.chdir(root)
-        actual_wheel = Path(uv_build.build_wheel(str(wheel.parent)))
-        actual_sdist = Path(uv_build.build_sdist(str(sdist.parent)))
+        with chdir(root):
+            actual_wheel = Path(uv_build.build_wheel(str(wheel.parent)))
+            actual_sdist = Path(uv_build.build_sdist(str(sdist.parent)))
         if actual_wheel.name != wheel.name or actual_sdist.name != sdist.name:
             raise ValueError(
                 f"unexpected distribution names: {actual_wheel}, {actual_sdist}"
