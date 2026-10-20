@@ -39,12 +39,31 @@ ts_project(
 ]]
 
 js_test(
-    name = "tool_tests",
+    name = "unit_tests",
     data = [
         ":build",
         ":node_modules",
     ],
     entry_point = "lib/tools.test.js",
+)
+
+js_test(
+    name = "compilation_test",
+    data = [
+        ":build",
+        ":node_modules/typescript",
+        "//typescript/_tools/testdata/compilation:fixtures",
+    ],
+    entry_point = "lib/compilation.test.js",
+    include_transitive_types = True,
+)
+
+test_suite(
+    name = "tool_tests",
+    tests = [
+        ":compilation_test",
+        ":unit_tests",
+    ],
 )
 
 js_library(

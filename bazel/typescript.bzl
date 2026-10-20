@@ -36,12 +36,22 @@ def typescript_module(name, srcs, deps = [], data = []):
         data: Runtime fixtures used by the module.
     """
     compilation = name.replace("/", "__") + "_compile"
+    module_compilations = [dep[1:].replace("/", "__") + "_compile" for dep in deps if dep.startswith(":") and not dep.startswith(":node_modules")]
     ts_project(
         name = compilation,
         srcs = srcs,
         # Internal declarations connect compilation units. Public declarations
         # apply the plugin's stripInternal setting separately at packaging time.
-        tsconfig = {"compilerOptions": {"stripInternal": False}},
+        # Override the package-wide include inherited from tsconfig.json. On
+        # Windows, all sources are visible in the shared execution directory;
+        # otherwise each compiler emits files owned by other module actions.
+        tsconfig = {
+            "compilerOptions": {"stripInternal": False},
+            "include": [],
+            # Resolve local imports to the referenced module's declarations,
+            # even when its .ts sources are visible outside a sandbox.
+            "references": [{"path": "./tsconfig_" + dep + ".json"} for dep in module_compilations],
+        },
         extends = ":tsconfig",
         out_dir = "lib",
         root_dir = "src",
@@ -49,7 +59,7 @@ def typescript_module(name, srcs, deps = [], data = []):
         incremental = True,
         declaration = True,
         source_map = True,
-        deps = [":node_modules/@types/node"] + deps,
+        deps = [":node_modules/@types/node"] + deps + [":" + dep for dep in module_compilations],
         data = srcs + data,
     )
 
@@ -88,7 +98,7 @@ def typescript_integration(modules, test_modules, name = "check", test_data = {}
     ts_project(
         name = "public_types",
         srcs = native.glob(["src/**/*.ts"], exclude = ["src/__tests__/**"]),
-        tsconfig = {"compilerOptions": {"outDir": "public-types"}},
+        tsconfig = {"compilerOptions": {"outDir": "public-types"}, "include": []},
         extends = ":tsconfig",
         out_dir = "public-types",
         root_dir = "src",
