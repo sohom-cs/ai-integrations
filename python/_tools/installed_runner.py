@@ -163,6 +163,9 @@ def main() -> int:
             "VIRTUAL_ENV": str(environment),
             "PYTHONPATH": os.pathsep.join([str(installed), str(root), *sys.path]),
         }
+        if os.name == "nt":
+            # Bazel sets HOME; Python's Windows expanduser uses USERPROFILE.
+            env["USERPROFILE"] = env.get("HOME", directory)
         return subprocess.run(
             [
                 str(interpreter),
