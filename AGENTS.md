@@ -205,7 +205,7 @@ Configure trusted publishing as described under [Python releases](#python-releas
 - Coordinates and root APIs are `@temporalio/<name>`. The development version is
   `0.0.0`. Node 22.12.0 is the minimum (provider packages require Node 22 and
   unflagged CommonJS loading of ES modules); CI tests the latest Node 22.x and 24.x
-  using major selectors with `check-latest: true`. Bazel pins pnpm 10.27.0 and both Node toolchains. Use `bazel test //typescript/<name>:lint //typescript/<name>:tests` and `bazel build //typescript/<name>:dist`.
+  using major selectors with `check-latest: true`. Bazel pins pnpm 10.34.5 and both Node toolchains. Use `bazel test //typescript/<name>:lint //typescript/<name>:tests` and `bazel build //typescript/<name>:dist`.
 - SDK and Workflow Streams dependencies use published npm coordinates. The
   unpublished SDK test helpers are copied into each consuming plugin's
   `tests/helpers/`, with a private development-only link. Never use a local

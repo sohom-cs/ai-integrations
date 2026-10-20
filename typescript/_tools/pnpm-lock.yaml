@@ -15,8 +15,8 @@ importers:
         specifier: 11.7.0
         version: 11.7.0
       pnpm:
-        specifier: 10.27.0
-        version: 10.27.0
+        specifier: 10.34.5
+        version: 10.34.5
       semver:
         specifier: ^7.7.2
         version: 7.8.5
@@ -139,8 +139,8 @@ packages:
       - validate-npm-package-name
       - which
 
-  pnpm@10.27.0:
-    resolution: {integrity: sha512-ctaZ2haxF5wUup5k3HHJpAmIy9xlwmTLDkidt96RfyDc9NZNhyNiXylpulLUt+KhFwaC2awqXcrqq3MrfhbwSg==}
+  pnpm@10.34.5:
+    resolution: {integrity: sha512-pO4F8vc2WCVb1qiYWcBlpFwopX2u+uLIk6Fo7itzFow3uR6D5X6mdlStA/AwMXRkMOi84442LgQmBfuKvIAZLg==}
     engines: {node: '>=18.12'}
     hasBin: true
 
@@ -198,7 +198,7 @@ snapshots:
 
   npm@11.7.0: {}
 
-  pnpm@10.27.0: {}
+  pnpm@10.34.5: {}
 
   semver@7.8.5: {}
 

@@ -24,7 +24,7 @@ export async function main(): Promise<void> {
   } else if (action === 'conventions') {
     for (const meta of all) {
       const dir=join(root(),meta.path), m=json(join(dir,'package.json')), name=meta.plugin.name;
-      if (name!==meta.path.split('/')[1] || meta.plugin.language!=='typescript' || meta.plugin.coordinate!==`@temporalio/${name}` || m.name!==meta.plugin.coordinate || m.version!=='0.0.0' || m.license!=='MIT' || m.packageManager!=='pnpm@10.27.0') throw new Error(`invalid TypeScript metadata: ${meta.path}`);
+      if (name!==meta.path.split('/')[1] || meta.plugin.language!=='typescript' || meta.plugin.coordinate!==`@temporalio/${name}` || m.name!==meta.plugin.coordinate || m.version!=='0.0.0' || m.license!=='MIT' || m.packageManager!=='pnpm@10.34.5') throw new Error(`invalid TypeScript metadata: ${meta.path}`);
       for (const file of ['BUILD.bazel','LICENSE','README.md','pnpm-lock.yaml','pnpm-workspace.yaml','tsconfig.json']) if (!existsSync(join(dir,file))) throw new Error(`missing ${dir}/${file}`);
       if (!readFileSync(join(dir,'LICENSE')).equals(readFileSync(join(root(),'LICENSE')))) throw new Error('LICENSE differs');
       for (const value of Object.values({...m.dependencies,...m.peerDependencies})) if (/^(link:|file:|workspace:)/.test(String(value))) throw new Error('cross-plugin local dependency');
