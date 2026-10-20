@@ -5,4 +5,4 @@ from pathlib import Path
 
 import pytest
 
-sys.exit(pytest.main([str(Path(__file__).with_name("tests")), "-q", *sys.argv[1:]]))
+sys.exit(pytest.main([str(Path(__file__).parent / sys.argv[1]), "-q", *sys.argv[2:]]))

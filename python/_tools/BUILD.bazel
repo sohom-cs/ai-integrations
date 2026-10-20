@@ -50,14 +50,15 @@ py_binary(
     deps = [":tools"],
 )
 
-py_test(
-    name = "tool_tests",
+[py_test(
+    name = source[:-3],
     size = "large",
     srcs = [
-        "build_dist.py",
-        "installed_runner.py",
         "test_main.py",
-    ] + glob(["tests/*.py"]),
+        "tests/conftest.py",
+        source,
+    ] + (["build_dist.py"] if source == "tests/test_build_dist.py" else []) + (["installed_runner.py"] if source == "tests/test_installed_runner.py" else []),
+    args = [source],
     data = [
         "new_python_plugin.py",
         "pyproject.toml",
@@ -77,6 +78,11 @@ py_test(
         "@python_tools//uv_build",
         "@rules_python//python/runfiles",
     ],
+) for source in glob(["tests/test_*.py"])]
+
+test_suite(
+    name = "tool_tests",
+    tests = [":" + source[:-3] for source in glob(["tests/test_*.py"])],
 )
 
 py_binary(

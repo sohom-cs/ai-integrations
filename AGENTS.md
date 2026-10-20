@@ -111,6 +111,18 @@ check formatting and types. Go `:lint` checks formatting; the selected SDK's vet
 Each language's `_tools/` owns its CI, release validation and artifact checks; run
 `bazel run //<language>/_tools:ci -- conventions` to check that language's conventions.
 
+Python and TypeScript `:tests` targets aggregate independently cached test modules. Run a
+single module with `bazel test //python/mcp:tests/test_pool` or
+`bazel test //typescript/vercel-ai-sdk:tests/base64.test`. Declare each test's local imports
+and runtime fixtures in its plugin's `BUILD.bazel`; avoid adding every test to shared
+runfiles. Python tests still install the complete plugin wheel and verify its provenance,
+so plugin source changes invalidate all tests that consume that wheel. TypeScript compiles
+individual modules, grouping mutually importing modules into one target; declare imports
+and modules loaded dynamically (such as workflow paths) in `typescript_module` dependencies.
+Production TypeScript builds and distributions exclude tests and test support. Internal
+declarations connect compilation targets; packaging emits public declarations with the
+plugin's original TypeScript settings, including `stripInternal`.
+
 Python, TypeScript and Java distribution files appear under
 `bazel-bin/<language>/<plugin>/dist/`. Go's `:dist` builds the module; its release is an
 immutable Git tag. Release builds pass `--//bazel:release_version=<version>` without
@@ -166,7 +178,7 @@ independent package locks, native publication artifacts and Windows coverage.
 - Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin can resolve incorrectly unless the SDK extends its package path. The Bazel test runner installs the SDK wheel and plugin wheel together, with the plugin last, and exports `UV_NO_EDITABLE=1`; `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild; `link-mode = "copy"` keeps overwrites deterministic.
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `python/_tools/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships; a plugin that depends on another plugin adds that coordinate too (`temporalio-mcp = false` in `openai_agents`), otherwise a fresh first-party release is invisible to `uv lock` for two weeks. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
-- Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). `bazel/python.bzl` owns build and test rules; `python/_shared/` owns composable Pyright/Ruff defaults; mypy and pydocstyle settings stay in each `pyproject.toml` because those tools cannot extend another config while preserving plugin overrides. Use `bazel test //python/<name>:lint //python/<name>:tests` and `bazel build //python/<name>:dist`.
+- Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), and pytest. Bazel schedules test modules independently; each module runs without a nested xdist worker pool. `bazel/python.bzl` owns build and test rules; `python/_shared/` owns composable Pyright/Ruff defaults; mypy and pydocstyle settings stay in each `pyproject.toml` because those tools cannot extend another config while preserving plugin overrides. Use `bazel test //python/<name>:lint //python/<name>:tests` and `bazel build //python/<name>:dist`.
 - Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Bind those options in a startup callback passed to `tests/helpers/environment.py`'s `start_local_with_retry`. This plugin-agnostic policy allows three startup attempts with a one-second delay for the SDK's explicit startup-deadline message; other errors and cancellation propagate immediately.
 - Test scaffolding: each plugin owns its provenance guard, local dev-server fixtures and pytest hooks. New plugins copy the standard implementations from `python/_template/tests/`; the conventions check keeps `environment.py`, `plugin_meta.py`, `provenance.py`, `test_env.py`, and `test_installed_matches_source.py` byte-identical to their canonical templates. Plugin-specific fixtures stay in that plugin's conftest. Tests must not require real provider credentials; use deterministic local models, mock transports, or in-process servers to exercise provider behavior in CI.
 

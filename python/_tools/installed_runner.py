@@ -24,17 +24,14 @@ def _copy_writable(source: str | Path, target: str | Path) -> str | Path:
     return copied
 
 
-def _run_checks(root: Path, wheel: Path, mode: str) -> int:
+def _run_checks(root: Path, wheel: Path, mode: str, test_file: str | None) -> int:
     os.chdir(root)
     if mode == "test":
         import pytest
 
-        os.environ.setdefault(
-            "PYTEST_XDIST_AUTO_NUM_WORKERS", str(min(os.cpu_count() or 1, 4))
-        )
-        return pytest.main(
-            ["-c", "pyproject.toml", "-n", "auto", "--dist=worksteal", "tests"]
-        )
+        assert test_file is not None
+        # Bazel schedules modules independently; keep one fixture scope per module.
+        return pytest.main(["-c", "pyproject.toml", test_file])
     if mode == "package":
         import importlib.metadata as metadata
 
@@ -76,7 +73,10 @@ def main() -> int:
     parser.add_argument("--extra-wheel", action="append", default=[])
     parser.add_argument("--mode", choices=["test", "lint", "package"], required=True)
     parser.add_argument("--prepared", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--test", help="One test module, relative to the plugin directory")
     args = parser.parse_args()
+    if args.mode == "test" and not args.test:
+        parser.error("test mode requires --test")
     resolver = runfiles.Create()
 
     def locate(value: str) -> Path:
@@ -91,7 +91,7 @@ def main() -> int:
     root = Path(resolver.Rlocation("_main/" + args.project + "/pyproject.toml")).parent
     wheel = locate(args.wheel)
     if args.prepared:
-        return _run_checks(root, wheel, args.mode)
+        return _run_checks(root, wheel, args.mode, args.test)
     server = os.environ.get("TEMPORAL_CLI_PATH")
     node = os.environ.get("NODE_BINARY")
     if node:

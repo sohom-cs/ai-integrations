@@ -1,5 +1,5 @@
 /** Deterministic npm archives and isolated installed-package verification. */
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, relative, sep } from 'node:path';
 import { createRequire } from 'node:module';
@@ -31,12 +31,17 @@ export async function checkPackage(project: string, archive: string, version?: s
     if (!files.has(`package/lib/${relative(join(project, 'src'), source).replace(/\.ts$/, '.js').split('\\').join('/')}`)) throw new Error(`missing compiled source: ${path}`);
   }
 }
-export async function pack(project: string, compiled: string, output: string, version: string): Promise<void> {
+export async function pack(project: string, compiled: string, output: string, version: string, declarations?: string): Promise<void> {
   const temp = mkdtempSync(join(tmpdir(), 'npm-pack-'));
   try {
     const staged = join(temp, 'package');
     cpSync(project, staged, { recursive: true, filter: p => !relative(project, p).split(/[\\/]/).some(s => ['node_modules','dist','lib','.git','__tests__','tests'].includes(s)) });
-    cpSync(compiled, join(staged, 'lib'), { recursive: true, filter: p => !relative(compiled,p).split(/[\\/]/).includes('__tests__') });
+    cpSync(compiled, join(staged, 'lib'), { recursive: true, dereference: true, filter: p => !relative(compiled,p).split(/[\\/]/).includes('__tests__') && (!declarations || !p.endsWith('.d.ts')) });
+    if (declarations) for (const file of walk(declarations)) {
+      const target = join(staged, 'lib', relative(declarations, file));
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, readFileSync(file));
+    }
     const manifest = json(join(staged, 'package.json')); manifest.version = version;
     writeFileSync(join(staged, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
     const included = walk(staged).filter(p => ['package.json','README.md','LICENSE'].includes(relative(staged,p)) || /^(src|lib)[\\/]/.test(relative(staged,p))).map(p => relative(temp,p));
@@ -72,7 +77,7 @@ export async function smoke(project: string, archive: string): Promise<void> {
 export async function main(): Promise<void> {
   const { positionals: [action], options: o } = argumentsOf();
   const project = resolve(root(), o['plugin-dir'] || o.project);
-  if (action === 'pack') await pack(project, resolve(root(), o.compiled), resolve(root(), o.output), o.version || '0.0.0');
+  if (action === 'pack') await pack(project, resolve(root(), o.compiled), resolve(root(), o.output), o.version || '0.0.0', o.declarations ? resolve(root(), o.declarations) : undefined);
   else if (action === 'check') await checkPackage(project, resolve(root(), o.archive), o.version);
   else if (action === 'smoke') await smoke(project, resolve(root(), o.archive));
   else throw new Error('expected pack, check, or smoke');

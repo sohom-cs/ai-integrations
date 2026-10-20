@@ -43,11 +43,13 @@ def _requirement_name(value):
         value = value.split(separator)[0]
     return value.lower().replace("-", "_").replace(".", "_")
 
-def python_integration(name = "check"):
+def python_integration(name = "check", test_deps = {}, test_data = {}):
     """Declare standard targets for a dependency-isolated Python plugin.
 
     Args:
         name: Name of the aggregate check suite.
+        test_deps: Local Python imports needed by each test or conftest, relative to the plugin.
+        test_data: Additional runfiles needed by an individual test.
     """
     package = native.package_name()
     meta = PLUGINS[package]
@@ -65,8 +67,11 @@ def python_integration(name = "check"):
         else:
             fail("Declare the build selection for dependency marker: " + root)
     deps = ["@%s//%s" % (hub, dependency) for dependency in sorted({_requirement_name(root): True for root in unconditional})]
+    lint_tools = ["ruff", "pyright", "basedpyright", "mypy", "pydocstyle"]
+    runtime_deps = ["@%s//%s" % (hub, dependency) for dependency in sorted({_requirement_name(root): True for root in unconditional}) if dependency not in lint_tools]
     if conditional:
         deps = deps + select({"//bazel:python310": conditional, "//conditions:default": []})
+        runtime_deps = runtime_deps + select({"//bazel:python310": conditional, "//conditions:default": []})
     namespace_wheels = ["@%s//%s:whl" % (hub, _requirement_name(root)) for root in roots if _requirement_name(root).startswith("temporalio_")]
     native.exports_files(["plugin.toml", "pyproject.toml", "uv.lock"])
     sources = native.glob(["src/**", "tests/**"], exclude = ["**/__pycache__/**", "**/*.pyc"])
@@ -81,19 +86,34 @@ def python_integration(name = "check"):
     )
     python_dist(name = "dist", srcs = inputs, coordinate = meta["plugin"]["coordinate"], project = package)
     native.filegroup(name = "wheel", srcs = [":dist"], output_group = "wheel")
-    for test_name, mode, extra in [("integration_tests", "test", []), ("lint", "lint", []), ("package_test", "package", ["//:LICENSE", ":dist"])]:
+    test_files = native.glob(["tests/**/test_*.py"])
+    checks = [(path[:-3], "test", path) for path in test_files]
+    checks += [("lint", "lint", None), ("package_test", "package", None)]
+    for test_name, mode, test_file in checks:
+        if mode == "test":
+            support = ["tests/__init__.py", "tests/conftest.py"]
+            support += test_deps.get("tests/conftest.py", [])
+            support += test_deps.get(test_file, [])
+            check_inputs = [test_file] + support + test_data.get(test_file, [])
+            if test_file == "tests/test_installed_matches_source.py":
+                check_inputs += inputs
+        elif mode == "package":
+            check_inputs = ["tests/__init__.py", "tests/helpers/__init__.py", "tests/helpers/plugin_meta.py", "tests/helpers/provenance.py", "//:LICENSE", ":dist"]
+            check_inputs += test_deps.get("tests/helpers/__init__.py", [])
+        else:
+            check_inputs = sources + inputs
         py_test(
             name = test_name,
             srcs = ["//python/_tools:installed_runner.py"],
             main = "//python/_tools:installed_runner.py",
-            args = ["--project", package, "--mode", mode, "--wheel", "$(rlocationpath :wheel)", "--sdk-wheel", "$(rlocationpath @%s//temporalio:whl)" % hub] + [value for wheel in namespace_wheels for value in ["--extra-wheel", "$(rlocationpath %s)" % wheel]],
-            data = sorted({path: True for path in sources + inputs + ["plugin.toml", ":wheel", "@%s//temporalio:whl" % hub, "//python/_shared:config", "//bazel/temporal:cli_python", "//bazel:node"] + namespace_wheels + extra}),
-            deps = deps + ["@rules_python//python/runfiles"],
+            args = ["--project", package, "--mode", mode, "--wheel", "$(rlocationpath :wheel)", "--sdk-wheel", "$(rlocationpath @%s//temporalio:whl)" % hub] + [value for wheel in namespace_wheels for value in ["--extra-wheel", "$(rlocationpath %s)" % wheel]] + (["--test", test_file] if test_file else []),
+            data = sorted({path: True for path in check_inputs + ["pyproject.toml", "plugin.toml", ":wheel", "@%s//temporalio:whl" % hub, "//python/_shared:config", "//bazel/temporal:cli_python", "//bazel:node"] + namespace_wheels}),
+            deps = (deps if mode == "lint" else runtime_deps) + ["@rules_python//python/runfiles"],
             env = {"TEMPORAL_CLI_PATH": "$(rlocationpath //bazel/temporal:cli_python)", "UV_NO_EDITABLE": "1", "NODE_BINARY": "$(rlocationpath //bazel:node)"},
             legacy_create_init = False,
             size = "large",
             timeout = "long",
             tags = ["no-remote-exec"] if mode == "test" else [],
         )
-    native.test_suite(name = "tests", tests = [":integration_tests"])
+    native.test_suite(name = "tests", tests = [":" + path[:-3] for path in test_files])
     native.test_suite(name = name, tests = [":lint", ":tests", ":package_test"])
