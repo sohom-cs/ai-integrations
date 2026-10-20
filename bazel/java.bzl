@@ -1,8 +1,8 @@
 """Bazel Java publications with separately locked compilation and runtime graphs."""
 
 load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
-load("@contrib_rules_jvm//java:defs.bzl", "create_jvm_test_suite", "java_junit5_test")
-load("@rules_java//java:defs.bzl", "JavaInfo", "java_library")
+load("@contrib_rules_jvm//java:defs.bzl", "create_jvm_test_suite", "java_junit5_test", "java_library")
+load("@rules_java//java:defs.bzl", "JavaInfo")
 
 def _short_junit5_test(name, **kwargs):
     # The JVM's Windows agent loader cannot open paths beyond MAX_PATH. Using
