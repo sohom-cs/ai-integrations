@@ -1,0 +1,13 @@
+load("@npm_openai_agents//:defs.bzl", "npm_link_all_packages")
+load("//bazel:typescript.bzl", "typescript_integration")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "plugin.toml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+typescript_integration()

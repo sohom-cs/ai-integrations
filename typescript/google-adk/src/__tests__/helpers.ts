@@ -60,7 +60,7 @@ export function uid(prefix: string): string {
 export function setupTestEnv(test: TestFn): () => TestWorkflowEnvironment {
   let env: TestWorkflowEnvironment;
   test.before(async () => {
-    env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+    env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal({ server: process.env.TEMPORAL_CLI_PATH ? { executable: { type: 'existing-path', path: process.env.TEMPORAL_CLI_PATH } } : undefined }));
   });
   test.after.always(async () => {
     await env?.teardown();

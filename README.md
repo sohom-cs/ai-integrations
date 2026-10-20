@@ -10,6 +10,9 @@ Plugins that connect AI agent frameworks and SDKs to [Temporal](https://temporal
 execution. Each plugin is its own package with its own dependencies, tests, version and release
 cadence.
 
+Development uses Bazel with pinned toolchains and independent package locks. See
+[Bazel development](BAZEL.md) for build, test, packaging and dependency-update commands.
+
 | Plugin | Package |
 |---|---|
 | [`go/googleadk`](go/googleadk) | [![Go Reference](https://pkg.go.dev/badge/go.temporal.io/googleadk.svg)](https://pkg.go.dev/go.temporal.io/googleadk) (Public Preview) |

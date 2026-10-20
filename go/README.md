@@ -1,35 +1,28 @@
 # Go integrations
 
-Plugins that connect Go AI frameworks and SDKs to Temporal. Each plugin lives
-in `go/<name>/` as an independent Go module with its own source, tests,
-`go.mod`, `go.sum`, `plugin.toml`, `Makefile`, `README.md` and `LICENSE`.
+See [AGENTS.md](../AGENTS.md) for repository conventions and release procedures.
+Install [Bazelisk](https://github.com/bazelbuild/bazelisk); `.bazelversion` pins Bazel and the module graph downloads the language toolchains.
 
-Each plugin's README describes its API and installation. Its `go.mod` sets
-the minimum Go version, and `plugin.toml` records its integration metadata.
-
-Run the shared make targets from the plugin directory, replacing `<name>`
-with the plugin's folder name:
+From the repository root:
 
 ```bash
-cd go/<name>
-make sync
-make lint
-make test
-make build
+bazel test //go/googleadk:tests
+bazel build //go/googleadk:dist
+bazel run //go/_tools:ci -- conventions
 ```
 
-Plugin Makefiles include [`_shared/go.mk`](_shared/go.mk). `make help` lists
-the targets; dependency checks use the committed module versions.
+Run `bazel test //go/googleadk:lint` to check formatting and types.
 
-CI reads each plugin's Go versions from `plugin.toml`, testing the minimum
-and maximum on Ubuntu and the maximum on macOS and Windows. The Ubuntu
-maximum-version job also runs race detection. Nightly checks use
-`make sync-latest` to upgrade compatible dependencies in the CI checkout;
-failures are tracked in a `nightly` issue for the plugin.
+Each plugin owns its dependencies and lockfiles. Ordinary Bazel builds preserve them. Intentional compatible upgrades use:
 
-Tests must not require provider credentials. Use deterministic local models,
-mock transports or in-process servers. Tests that need Temporal start a local
-dev server and may download the Temporal CLI on first use.
+```bash
+bazel run //go/_tools:dev -- update --plugin-dir go/googleadk
+bazel mod deps --lockfile_mode=update
+```
 
-Repository conventions are in
-[`AGENTS.md`](../AGENTS.md).
+Review the changed manifests and locks before committing. CI performs these updates in a disposable checkout for nightly checks. Cross-plugin dependencies use published coordinates.
+
+Tests use local provider doubles and provision a Temporal server without provider credentials. Temporal CLI archives and checksums are declared in `bazel/temporal.MODULE.bazel`.
+Publication artifacts are written under `bazel-bin/go/googleadk/dist/`. A protected release version is supplied with `--//bazel:release_version=<version>`; committed development versions remain `0.0.0`.
+
+The native tools in `_tools/` own CI, release validation and artifact checks.

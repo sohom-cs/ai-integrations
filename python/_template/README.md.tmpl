@@ -16,7 +16,7 @@ uv add __COORDINATE__
 ## Develop
 
 ```bash
-make sync   # install (non-editable) into .venv
-make lint
-make test
+bazel run //python/_tools:dev -- venv --plugin-dir python/__NAME__
+bazel test //python/__NAME__:lint
+bazel test //python/__NAME__:tests
 ```

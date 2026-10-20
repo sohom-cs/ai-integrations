@@ -48,7 +48,7 @@ class SpringBootAutoConfigurationTest {
                 + Path.of(System.getProperty("java.home"), "bin", "java"),
             "spring.ai.mcp.client.stdio.connections.filesystem.args[0]=-cp",
             "spring.ai.mcp.client.stdio.connections.filesystem.args[1]="
-                + System.getProperty("mcp.test.classpath"),
+                + System.getProperty("mcp.test.classpath", System.getProperty("java.class.path")),
             "spring.ai.mcp.client.stdio.connections.filesystem.args[2]="
                 + StdioMcpTestServer.class.getName())
         .run(
