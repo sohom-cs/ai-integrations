@@ -6,6 +6,7 @@ import argparse
 import importlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,57 @@ from pathlib import Path
 from python.runfiles import runfiles
 
 
+def _copy_writable(source: str | Path, target: str | Path) -> str | Path:
+    copied = shutil.copy2(source, target)
+    path = Path(copied)
+    path.chmod(stat.S_IMODE(path.stat().st_mode) | stat.S_IWUSR)
+    return copied
+
+
+def _run_checks(root: Path, wheel: Path, mode: str) -> int:
+    os.chdir(root)
+    if mode == "test":
+        import pytest
+
+        os.environ.setdefault(
+            "PYTEST_XDIST_AUTO_NUM_WORKERS", str(min(os.cpu_count() or 1, 4))
+        )
+        return pytest.main(
+            ["-c", "pyproject.toml", "-n", "auto", "--dist=worksteal", "tests"]
+        )
+    if mode == "package":
+        import importlib.metadata as metadata
+
+        from tests.helpers.plugin_meta import load_plugin_meta
+        from tests.helpers.provenance import check_provenance
+
+        meta = load_plugin_meta(root)
+        check_provenance(meta.coordinate, meta.package_relpath)
+        importlib.import_module(meta.root_api)
+        assert metadata.distribution(meta.coordinate).version in wheel.name
+        return 0
+    commands = [
+        ["ruff", "check", "--select", "I"],
+        ["ruff", "format", "--check"],
+        ["pyright", "--pythonpath", sys.executable],
+        ["mypy"],
+        ["basedpyright", "--pythonpath", sys.executable],
+        ["pydocstyle", "--ignore-decorators=overload", "src"],
+    ]
+    for module, *arguments in commands:
+        if module == "ruff":
+            executable = Path(sys.executable).parent / (
+                "ruff.exe" if os.name == "nt" else "ruff"
+            )
+            command = [str(executable), *arguments]
+        else:
+            command = [sys.executable, "-m", module, *arguments]
+        result = subprocess.run(command, check=False)
+        if result.returncode:
+            return result.returncode
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
@@ -23,6 +75,7 @@ def main() -> int:
     parser.add_argument("--sdk-wheel", required=True)
     parser.add_argument("--extra-wheel", action="append", default=[])
     parser.add_argument("--mode", choices=["test", "lint", "package"], required=True)
+    parser.add_argument("--prepared", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     resolver = runfiles.Create()
 
@@ -37,6 +90,8 @@ def main() -> int:
 
     root = Path(resolver.Rlocation("_main/" + args.project + "/pyproject.toml")).parent
     wheel = locate(args.wheel)
+    if args.prepared:
+        return _run_checks(root, wheel, args.mode)
     server = os.environ.get("TEMPORAL_CLI_PATH")
     node = os.environ.get("NODE_BINARY")
     if node:
@@ -65,22 +120,26 @@ def main() -> int:
         dependency_paths = [
             Path(path)
             for path in sys.path
-            if Path(path).name == "site-packages" and Path(path).is_dir()
+            if Path(path).name == "site-packages"
+            and Path(path).is_dir()
+            and not (Path(path) / "_bazel_site_init.py").is_file()
         ]
         # Merge the independently locked installed wheels into one environment,
         # matching a normal installation for regular and namespace packages.
         for dependency_path in dependency_paths:
-            shutil.copytree(dependency_path, installed, dirs_exist_ok=True)
+            # Runfiles may be read-only. Keep merged files writable so overlapping
+            # wheel paths can be replaced, including the SDK and plugin below.
+            shutil.copytree(
+                dependency_path,
+                installed,
+                dirs_exist_ok=True,
+                copy_function=_copy_writable,
+            )
             binaries = dependency_path.parent / "bin"
             if binaries.is_dir():
                 for binary in binaries.iterdir():
                     if binary.is_file():
-                        shutil.copy2(binary, scripts / binary.name)
-        os.environ["PATH"] = str(scripts) + os.pathsep + os.environ.get("PATH", "")
-        # The interpreter is also used by xdist and provider subprocesses, whose
-        # deliberately restricted environments may omit PYTHONPATH.
-        sys.executable = str(interpreter)
-        os.environ["VIRTUAL_ENV"] = str(environment)
+                        _copy_writable(binary, scripts / binary.name)
         for dependency in [args.sdk_wheel, *args.extra_wheel]:
             with zipfile.ZipFile(locate(dependency)) as sdk:
                 sdk.extractall(installed)
@@ -96,53 +155,25 @@ def main() -> int:
                         "integration wheels must not contain wheel .data paths"
                     )
             archive.extractall(installed)
-        sys.path.insert(0, str(installed))
-        sys.path.insert(1, str(root))
-        # The SDK extends its regular package path to discover independently installed plugins.
-        importlib.invalidate_caches()
-        os.environ["PYTHONPATH"] = os.pathsep.join(sys.path)
-        os.chdir(root)
-        if args.mode == "test":
-            import pytest
-
-            os.environ.setdefault(
-                "PYTEST_XDIST_AUTO_NUM_WORKERS", str(min(os.cpu_count() or 1, 4))
-            )
-
-            return pytest.main(
-                ["-c", "pyproject.toml", "-n", "auto", "--dist=worksteal", "tests"]
-            )
-        if args.mode == "package":
-            import importlib.metadata as metadata
-
-            from tests.helpers.plugin_meta import load_plugin_meta
-            from tests.helpers.provenance import check_provenance
-
-            meta = load_plugin_meta(root)
-            check_provenance(
-                meta.coordinate,
-                meta.package_relpath,
-            )
-            importlib.import_module(meta.root_api)
-            assert metadata.distribution(meta.coordinate).version in wheel.name
-            return 0
-        commands = [
-            ["ruff", "check", "--select", "I"],
-            ["ruff", "format", "--check"],
-            ["pyright", "--pythonpath", sys.executable],
-            ["mypy"],
-            ["basedpyright", "--pythonpath", sys.executable],
-            ["pydocstyle", "--ignore-decorators=overload", "src"],
-        ]
-        for module, *arguments in commands:
-            if module == "ruff":
-                executable = scripts / ("ruff.exe" if os.name == "nt" else "ruff")
-                command = [str(executable), *arguments]
-            else:
-                command = [sys.executable, "-m", module, *arguments]
-            result = subprocess.run(command, check=False)
-            if result.returncode:
-                return result.returncode
+        # Native extensions stay loaded until their process exits on Windows.
+        # Run checks in the venv's interpreter, then remove it from the parent.
+        env = {
+            **os.environ,
+            "PATH": str(scripts) + os.pathsep + os.environ.get("PATH", ""),
+            "VIRTUAL_ENV": str(environment),
+            "PYTHONPATH": os.pathsep.join([str(installed), str(root), *sys.path]),
+        }
+        return subprocess.run(
+            [
+                str(interpreter),
+                str(Path(__file__).absolute()),
+                *sys.argv[1:],
+                "--prepared",
+            ],
+            cwd=root,
+            env=env,
+            check=False,
+        ).returncode
     return 0
 
 

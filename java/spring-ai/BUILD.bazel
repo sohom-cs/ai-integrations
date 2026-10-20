@@ -1,6 +1,5 @@
-load("@contrib_rules_jvm//java:defs.bzl", "java_test_suite")
 load("@rules_java//java:defs.bzl", "java_library")
-load("//bazel:java.bzl", "java_dist")
+load("//bazel:java.bzl", "java_dist", "java_junit5_test_suite")
 
 exports_files(["plugin.toml"])
 
@@ -900,7 +899,7 @@ alias(
     }),
 )
 
-java_test_suite(
+java_junit5_test_suite(
     name = "tests",
     size = "large",
     timeout = "long",
@@ -908,7 +907,6 @@ java_test_suite(
     javacopts = ["-parameters"],
     jvm_flags = ["-Xmx1g"],
     package = "io.temporal.springai",
-    runner = "junit5",
     runtime_deps = [
         ":test_runtime",
         "@maven_junit6_runner//:org_junit_platform_junit_platform_reporting",

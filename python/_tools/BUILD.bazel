@@ -55,6 +55,7 @@ py_test(
     size = "large",
     srcs = [
         "build_dist.py",
+        "installed_runner.py",
         "test_main.py",
     ] + glob(["tests/*.py"]),
     data = [
@@ -74,6 +75,7 @@ py_test(
         "@python_tools//pytest",
         "@python_tools//pyyaml",
         "@python_tools//uv_build",
+        "@rules_python//python/runfiles",
     ],
 )
 
