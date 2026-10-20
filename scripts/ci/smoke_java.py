@@ -79,8 +79,6 @@ application { mainClass = 'Consumer' }
         command = ['bash', str(plugin_dir / 'gradlew'), '--no-daemon', '-p', str(consumer), 'run']
         subprocess.run(command, cwd=plugin_dir, check=True, env=os.environ.copy())
     print(f'OK: clean consumer installed {group}:{artifact}:{version}')
-    if source:
-        print(f'OK: {":".join(source)} relocated to {group}:{artifact}:{version}')
 
 
 if __name__ == '__main__':
