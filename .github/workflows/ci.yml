@@ -16,7 +16,7 @@ on:
   pull_request:
     # `edited` covers base-branch retargeting (a stacked PR whose base merged), so `changes`
     # is recomputed against the new base instead of keeping the stale selection.
-    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
   merge_group:
   push:
     branches: [main]
@@ -36,6 +36,30 @@ defaults:
     shell: bash
 
 jobs:
+  cla-recheck:
+    name: CLA recheck
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(fromJSON('["opened", "synchronize", "reopened", "ready_for_review"]'), github.event.action)
+    # Runs alongside tests and stays outside ci-status's required dependencies.
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Recover a missing CLA Assistant result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci/cla_recheck.py --pr "$PR_NUMBER" --sha "$PR_HEAD_SHA"
+
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
