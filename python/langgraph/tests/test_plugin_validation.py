@@ -11,7 +11,7 @@ import pytest
 from langchain_core.runnables import RunnableLambda
 from langgraph.func import task  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
-from langgraph.runtime import Runtime
+from langgraph.runtime import Runtime, get_runtime
 from langgraph.types import RetryPolicy  # pyright: ignore[reportMissingTypeStubs]
 from pytest import raises
 from typing_extensions import TypedDict
@@ -35,6 +35,10 @@ async def async_node(state: State) -> dict[str, str]:  # pyright: ignore[reportU
 
 def sync_node(state: State) -> dict[str, str]:  # pyright: ignore[reportUnusedParameter]
     return {"value": "done"}
+
+
+async def context_type_node(state: State) -> str:  # pyright: ignore[reportUnusedParameter]
+    return type(get_runtime().context).__name__
 
 
 def test_non_runnable_callable_node_raises() -> None:
@@ -109,6 +113,40 @@ def test_context_schema_id_conflict_raises() -> None:
                 "second": StateGraph(State, context_schema=second),
             }
         )
+
+
+def test_non_class_context_schema() -> None:
+    LangGraphPlugin(graphs={"g": StateGraph(State, context_schema=dict[str, Any])})
+
+
+@pytest.mark.parametrize(
+    ("context_schema", "schema_id", "restore_context_types", "expected_type"),
+    [
+        # Payloads from 0.1.0 Workflows have no schema ID. Graph nodes know
+        # their schema; tasks can be shared by several schemas.
+        (Context, None, True, "Context"),
+        (None, None, True, "dict"),
+        (Context, "unknown", False, "dict"),
+    ],
+)
+async def test_context_payload_restoration(
+    context_schema: type[Any] | None,
+    schema_id: str | None,
+    restore_context_types: bool,
+    expected_type: str,
+) -> None:
+    wrapped = wrap_activity(
+        context_type_node,
+        context_schema=context_schema,
+        restore_context_types=restore_context_types,
+    )
+    config: dict[str, Any] = {"context": {"user_id": "alice"}}
+    if schema_id is not None:
+        config["context_schema_id"] = schema_id
+    output = await wrapped(
+        ActivityInput(args=({},), kwargs={}, langgraph_config=config)
+    )
+    assert output.result == expected_type
 
 
 @pytest.mark.parametrize("unknown_id", [False, True])

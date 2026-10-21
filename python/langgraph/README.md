@@ -153,6 +153,23 @@ For Pydantic v2 contexts, configure `temporalio.contrib.pydantic.pydantic_data_c
 
 **Breaking change:** class-based contexts now reach Activity nodes and tasks as their declared type. Replace dictionary-based workarounds such as `runtime.context["user_id"]` with `runtime.context.user_id`. Passing a dictionary to a declared class schema does not preserve dictionary access: LangGraph converts it to the schema type. Context schema IDs also extend the serialized Activity input. See the [implementation plan](CONTEXT-RESTORATION-PLAN.md) for the scope and the separate compatibility project.
 
+#### Upgrading from 0.1.0
+
+To upgrade without changing node or task code, turn off context restoration:
+
+```python
+plugin = LangGraphPlugin(graphs={...}, restore_context_types=False)
+```
+
+Activity nodes and tasks then receive the context as in 0.1.0, as decoded by the payload converter, and contexts of undeclared classes are allowed. Workers of both versions can run side by side, and Workflows started on 0.1.0 continue on the new version: 0.1.0 workers ignore the new schema ID in the Activity input.
+
+To switch to typed contexts later:
+
+1. With restoration still off, declare every class you pass as context as a graph or entrypoint `context_schema`, and deploy. With restoration on, an undeclared class fails the Workflow task, including in Workflows that are already running.
+2. Replace dictionary access with attribute access, remove `restore_context_types=False`, and deploy.
+
+Workers with either setting can run side by side during this change, because each one passes the context in the form its own code expects. A Functional API task scheduled by a 0.1.0 worker carries no schema ID, so a worker with restoration on passes it a dictionary. Upgrading with restoration off first avoids this. When upgrading directly from 0.1.0, use Worker Versioning or let older Activities finish first.
+
 ## Summaries
 
 Summaries are short, human-readable labels that show up in the Temporal UI and CLI, making it easier to see what each step of a run is doing.

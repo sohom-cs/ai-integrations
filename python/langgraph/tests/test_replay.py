@@ -1,13 +1,14 @@
 import sys
 import warnings
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.langgraph import LangGraphPlugin
 from temporalio.worker import Replayer, Worker
@@ -84,6 +85,39 @@ async def test_replay(client: Client, context_kind: str):
         for w in recorder
         if "was imported after initial workflow load" in str(w.message)
     ]
+
+
+@pytest.mark.parametrize("restore_context_types", [True, False])
+@pytest.mark.parametrize("context_kind", ["dataclass", "undeclared"])
+async def test_replay_0_1_0_history(context_kind: str, restore_context_types: bool):
+    """Replay histories recorded by running TwoNodesWorkflow on plugin 0.1.0."""
+    g = StateGraph(
+        State, context_schema=Context if context_kind == "dataclass" else None
+    )
+    g.add_node("node_a", node_a, metadata={"execute_in": "activity"})
+    g.add_node("node_b", node_b, metadata={"execute_in": "activity"})
+    g.add_edge(START, "node_a")
+    g.add_edge("node_a", "node_b")
+    plugin = LangGraphPlugin(
+        graphs={"my-graph": g},
+        default_activity_options={"start_to_close_timeout": timedelta(seconds=10)},
+        restore_context_types=restore_context_types,
+    )
+    path = Path(__file__).parent / "histories" / f"0.1.0-{context_kind}.json"
+
+    result = await Replayer(
+        workflows=[TwoNodesWorkflow],
+        plugins=[plugin],
+    ).replay_workflow(
+        WorkflowHistory.from_json(path.stem, path.read_text()),
+        raise_on_replay_failure=False,
+    )
+
+    if context_kind == "undeclared" and restore_context_types:
+        # Restoring context types requires each context class to be declared.
+        assert "is not registered" in str(result.replay_failure)
+    else:
+        assert result.replay_failure is None
 
 
 @pytest.mark.skipif(

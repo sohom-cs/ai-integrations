@@ -114,6 +114,7 @@ def wrap_activity(
     *,
     context_schema: type[Any] | None = None,
     context_schemas: dict[str, type[Any]] | None = None,
+    restore_context_types: bool = True,
     streaming_topic: str | None = None,
     streaming_batch_interval: timedelta = timedelta(milliseconds=100),
 ) -> Callable[[ActivityInput], Awaitable[ActivityOutput]]:
@@ -136,9 +137,9 @@ def wrap_activity(
 
                 effective_writer = thread_safe_writer
 
-            schema = context_schema
+            schema = context_schema if restore_context_types else None
             schema_id = input.langgraph_config.get("context_schema_id")
-            if schema_id is not None:
+            if schema_id is not None and restore_context_types:
                 schema = (context_schemas or {}).get(schema_id)
                 if schema is None:
                     raise ValueError(f"Unknown context schema ID: {schema_id!r}")
@@ -178,6 +179,7 @@ def wrap_execute_activity(
     task_id: str = "",
     summary_fn: Callable[[tuple[Any, ...], dict[str, Any]], str | None] | None = None,
     context_schemas: dict[str, type[Any]] | None = None,
+    restore_context_types: bool = True,
     **execute_activity_kwargs: Any,
 ) -> Callable[..., Any]:
     """Wrap an activity function to be called via workflow.execute_activity with caching."""
@@ -215,12 +217,13 @@ def wrap_execute_activity(
         context_type = type(langgraph_config.get("context"))
         if is_context_schema(context_type):
             schema_id = context_schema_id(context_type)
-            if schema_id not in (context_schemas or {}):
+            if schema_id in (context_schemas or {}):
+                langgraph_config["context_schema_id"] = schema_id
+            elif restore_context_types:
                 raise ValueError(
                     f"Context type {schema_id!r} is not registered. "
                     "Declare it as a graph or entrypoint context_schema."
                 )
-            langgraph_config["context_schema_id"] = schema_id
 
         # Check task result cache (for continue-as-new deduplication).
         key = (

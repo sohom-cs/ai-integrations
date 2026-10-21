@@ -121,3 +121,14 @@ This project is separate and does not gate the main implementation.
 Deliver an upgrade guide and tested support matrix. Decoding old bytes,
 preserving application behavior, and continuing old Workflow runs are separate
 compatibility promises.
+
+Implementation:
+
+- `restore_context_types=False` keeps the 0.1.0 behavior: no restoration and
+  no rejection of undeclared classes. Workflows still attach schema IDs for
+  declared classes, so turning restoration on later is a rolling deploy.
+- Payloads without schema IDs: graph nodes use their captured schema; tasks
+  receive dictionaries. Aliases for renamed schema classes are not included.
+- Workflow commands did not change, so 0.1.0 histories replay without
+  patching. Saved 0.1.0 histories test replay with both settings.
+- The README's "Upgrading from 0.1.0" section is the upgrade guide.

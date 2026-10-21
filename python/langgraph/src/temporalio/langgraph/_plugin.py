@@ -124,6 +124,12 @@ class LangGraphPlugin(SimplePlugin):
             non-interactive aggregation, lower toward 10–50ms only if
             you've measured the latency need and accept the history
             cost.
+        restore_context_types: Rebuild dataclass and Pydantic contexts
+            as their registered ``context_schema`` class in
+            activity-bound nodes and tasks. Set to ``False`` to keep the
+            0.1.0 behavior: Activity code receives the context as decoded
+            by the payload converter (a dictionary for class-based
+            contexts), and contexts of undeclared classes are allowed.
     """
 
     def __init__(
@@ -138,6 +144,7 @@ class LangGraphPlugin(SimplePlugin):
         default_activity_options: dict[str, Any] | None = None,
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
+        restore_context_types: bool = True,
     ):
         """Initialize the LangGraph plugin with graphs, entrypoints, and tasks.
 
@@ -176,6 +183,7 @@ class LangGraphPlugin(SimplePlugin):
         self.activities: list = []
         self._streaming_topic = streaming_topic
         self._streaming_batch_interval = streaming_batch_interval
+        self._restore_context_types = restore_context_types
         self._context_schemas: dict[str, type[Any]] = {}
         schemas: list[type[Any] | None] = [
             *(graph.context_schema for graph in (graphs or {}).values()),
@@ -337,6 +345,7 @@ class LangGraphPlugin(SimplePlugin):
                 func,
                 context_schema=context_schema,
                 context_schemas=self._context_schemas,
+                restore_context_types=self._restore_context_types,
                 streaming_topic=self._streaming_topic,
                 streaming_batch_interval=self._streaming_batch_interval,
             )
@@ -347,6 +356,7 @@ class LangGraphPlugin(SimplePlugin):
                 task_id=task_id(func),
                 summary_fn=summary_fn,
                 context_schemas=self._context_schemas,
+                restore_context_types=self._restore_context_types,
                 **opts,
             )
         elif execute_in == "workflow":

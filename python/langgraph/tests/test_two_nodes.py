@@ -92,7 +92,7 @@ class TwoNodesWorkflow:
             computed_context = ComputedContext(user_id="alice")
             computed_context.label = "saved"
             context = computed_context
-        elif context_kind == "dataclass":
+        elif context_kind in ("dataclass", "legacy", "undeclared"):
             context = Context(user_id="alice")
         elif context_kind in ("dict", "typeddict"):
             context = DictContext(user_id="alice")
@@ -116,6 +116,8 @@ class TwoNodesWorkflow:
         ("typeddict", "dict"),
         ("model", "ModelContext"),
         ("model_dict", "ModelContext"),
+        ("legacy", "dict"),
+        ("undeclared", "dict"),
     ],
 )
 async def test_two_nodes(
@@ -132,9 +134,10 @@ async def test_two_nodes(
         else DictContext
         if context_kind == "typeddict"
         else Context
-        if context_kind in ("dataclass", "dict")
+        if context_kind in ("dataclass", "dict", "legacy")
         else None
     )
+    legacy = context_kind in ("legacy", "undeclared")
     g = StateGraph(State, context_schema=schema)
     g.add_node("node_a", node_a, metadata={"execute_in": first_node_execution})
     g.add_node("node_b", node_b, metadata={"execute_in": "activity"})
@@ -157,6 +160,7 @@ async def test_two_nodes(
                 default_activity_options={
                     "start_to_close_timeout": timedelta(seconds=10)
                 },
+                restore_context_types=not legacy,
             )
         ],
     ):
@@ -174,6 +178,9 @@ async def test_two_nodes(
         expected_value = "aalice:acmebalice:acme"
     assert result == {
         "value": expected_value,
-        "context_type_a": expected_context_type,
+        # Without restoration, only Activity nodes see the decoded dictionary.
+        "context_type_a": "Context"
+        if legacy and first_node_execution == "workflow"
+        else expected_context_type,
         "context_type_b": expected_context_type,
     }

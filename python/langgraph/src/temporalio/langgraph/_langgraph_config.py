@@ -25,9 +25,11 @@ from langgraph.runtime import ExecutionInfo, Runtime
 from pydantic import BaseModel
 
 
-def is_context_schema(schema: type[Any]) -> bool:
+def is_context_schema(schema: object) -> bool:
     """Return whether a context class can be restored after payload conversion."""
-    return dataclasses.is_dataclass(schema) or issubclass(schema, BaseModel)
+    return isinstance(schema, type) and (
+        dataclasses.is_dataclass(schema) or issubclass(schema, BaseModel)
+    )
 
 
 def context_schema_id(schema: type[Any]) -> str:
