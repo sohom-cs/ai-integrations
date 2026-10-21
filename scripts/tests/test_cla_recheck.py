@@ -199,13 +199,14 @@ def http_server(monkeypatch):
 
 
 @pytest.mark.parametrize("code", [200, 302])
-def test_http_acknowledgement_does_not_follow_redirects_or_send_github_token(http_server, code):
+def test_http_acknowledgement_does_not_follow_redirects_or_send_github_token(http_server, code, capsys):
     cla._recheck(REPO, code)
     assert len(http_server) == 1
     path, headers = http_server[0]
     assert path == f"/check/{REPO}?pullRequest={code}"
     assert "Authorization" not in headers
     assert "github-token-must-not-reach-cla" not in str(headers)
+    assert f"HTTP {code}; awaiting its status on GitHub" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("code,error", [(429, cla.RecheckUnavailable), (503, cla.RecheckUnavailable), (403, cla.RecheckRejected)])
@@ -220,6 +221,17 @@ def test_timeout_has_a_visible_summary(clock, monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     assert cla.retry_cla(REPO, 129, SHA, timeout_seconds=10) == 1
     assert "no license/cla result after 10s" in summary.read_text()
+
+
+def test_logs_show_the_wait_and_when_the_provider_posted_its_result(clock, monkeypatch, capsys):
+    monkeypatch.setattr(cla, "_recheck", lambda *_: None)
+    monkeypatch.setattr(cla, "_cla_status", lambda *_: {
+        "state": "success", "created_at": "2026-10-21T21:22:50Z",
+    } if clock.now >= 40 else None)
+    assert cla.retry_cla(REPO, 131, SHA) == 0
+    logs = capsys.readouterr().out
+    assert "Next GitHub check in 30s" in logs
+    assert "status created 2026-10-21T21:22:50Z" in logs
 
 
 def test_workflow_starts_recovery_alongside_ci_with_read_only_permissions():

@@ -66,17 +66,19 @@ def _recheck(repo: str, number: int) -> None:
         headers={"User-Agent": "temporalio-ai-integrations-cla-recheck"},
     )
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=REQUEST_TIMEOUT_SECONDS):
-            pass
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            code = response.status
     except urllib.error.HTTPError as error:
         error.close()
         if 300 <= error.code < 400:
-            return  # Acknowledgement only; verify GitHub on the next attempt.
-        if error.code == 429 or 500 <= error.code < 600:
+            code = error.code
+        elif error.code == 429 or 500 <= error.code < 600:
             raise RecheckUnavailable(f"CLA Assistant returned HTTP {error.code}") from error
-        raise RecheckRejected(f"CLA Assistant returned HTTP {error.code}") from error
+        else:
+            raise RecheckRejected(f"CLA Assistant returned HTTP {error.code}") from error
     except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
         raise RecheckUnavailable(f"CLA Assistant could not be reached: {error}") from error
+    print(f"CLA Assistant returned HTTP {code}; awaiting its status on GitHub.", flush=True)
 
 
 def _finish(message: str, *, failed: bool = False) -> int:
@@ -92,7 +94,7 @@ def retry_cla(repo: str, number: int, sha: str, *, timeout_seconds: int = TIMEOU
     deadline = time.monotonic() + timeout_seconds
     backoff = GRACE_SECONDS
     attempts = 0
-    print(f"Watching {repo}#{number} at {sha}; first recheck after {GRACE_SECONDS}s.", flush=True)
+    print(f"Watching {repo}#{number} at {sha}; first GitHub check after {GRACE_SECONDS}s.", flush=True)
     time.sleep(min(GRACE_SECONDS, timeout_seconds))
 
     while True:
@@ -106,7 +108,8 @@ def retry_cla(repo: str, number: int, sha: str, *, timeout_seconds: int = TIMEOU
             if status:
                 # Pending means unsigned in CLA Assistant. All existing verdicts
                 # belong to the provider; this helper only recovers missing ones.
-                return _finish(f"PR #{number}: {CONTEXT} reported {status['state']} after {attempts} recheck(s).")
+                created = f" (status created {status['created_at']})" if status.get("created_at") else ""
+                return _finish(f"PR #{number}: {CONTEXT} reported {status['state']}{created} after {attempts} recheck(s).")
 
             if time.monotonic() >= deadline:
                 break
@@ -128,7 +131,9 @@ def retry_cla(repo: str, number: int, sha: str, *, timeout_seconds: int = TIMEOU
             break
         # An accepted redirect may never produce a status. Verify it at the
         # next attempt, including one final read when the retry window ends.
-        time.sleep(min(backoff, remaining))
+        wait = min(backoff, remaining)
+        print(f"Next GitHub check in {wait:.0f}s.", flush=True)
+        time.sleep(wait)
         backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
 
     return _finish(
