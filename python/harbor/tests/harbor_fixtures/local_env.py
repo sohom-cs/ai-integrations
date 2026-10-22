@@ -111,3 +111,26 @@ class LocalEnvironment(BaseEnvironment):
         source = self._map(source_dir)
         if source.exists():
             shutil.copytree(source, target_dir, dirs_exist_ok=True)
+
+
+class NoCredentialsEnvironment(LocalEnvironment):
+    """Fails harbor's environment check, as a provider does without credentials."""
+
+    @classmethod
+    def preflight(cls) -> None:
+        raise SystemExit("LOCAL_API_KEY is not set")
+
+
+class UnstartableEnvironment(LocalEnvironment):
+    """Fails to start, as an environment whose image does not build does."""
+
+    async def start(self, force_build: bool) -> None:
+        raise RuntimeError("the environment's image did not build")
+
+
+class UnstoppableEnvironment(LocalEnvironment):
+    """Fails to stop after the trial ran, as a sandbox whose connection dropped does."""
+
+    async def stop(self, delete: bool) -> None:
+        await super().stop(delete)
+        raise RuntimeError("the environment did not stop")

@@ -88,9 +88,7 @@ ignore_missing_imports = true
 [tool.pyright]
 extends = "../_shared/pyrightconfig.json"
 include = ["src", "tests"]
-# harbor ships without a py.typed marker. Its inline annotations are still read
-# from source, so the plugin is type-checked against them; the marker alone is
-# what is missing.
+# harbor ships no py.typed marker; pyright still reads its inline annotations.
 reportMissingTypeStubs = "none"
 
 # Resolve the plugin's own modules from source rather than from site-packages.

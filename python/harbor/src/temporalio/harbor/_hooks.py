@@ -5,16 +5,12 @@ from __future__ import annotations
 import contextlib
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 
-from harbor.models.job.config import RetryConfig
 from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.result import TrialResult
 from harbor.trial.trial import Trial
 from pydantic import JsonValue
-
-from temporalio.harbor import _compat
 
 
 @dataclass(frozen=True)
@@ -25,16 +21,20 @@ class TrialContext:
     """
 
     config: TrialConfig
-    """The trial, as the workflow passed it to :func:`execute_trial`."""
+    """The ``config`` of the :class:`temporalio.harbor.TrialPlan` the workflow
+    passed to :func:`temporalio.harbor.execute_trial`.
 
-    retry: RetryConfig
-    """Harbor's retry configuration for the trial."""
+    After entering :meth:`TrialHooks.scope` and before calling
+    :meth:`TrialHooks.trial_created`, the attempt replaces ``agent.skills``, in
+    place, with the local paths its skill sources resolve to.
+    """
 
     attempt: int
     """The Activity attempt, counting from 1."""
 
     data: JsonValue
-    """What the workflow passed as ``data`` to :func:`execute_trial`."""
+    """What the workflow passed as ``data`` to
+    :func:`temporalio.harbor.execute_trial`."""
 
     @property
     def trial_dir(self) -> Path:
@@ -42,38 +42,33 @@ class TrialContext:
         return Path(self.config.trials_dir) / self.config.trial_name
 
 
-@dataclass(frozen=True)
-class TrialRetry:
-    """Run the trial again, after ``delay``.
-
-    This class is experimental and may change in future versions.
-    """
-
-    delay: timedelta
-
-    def __post_init__(self) -> None:
-        """Reject a negative delay."""
-        if self.delay < timedelta(0):
-            raise ValueError("delay must not be negative")
-
-
 class TrialHooks:
     """Take part in how the trial Activity runs each trial.
 
     This class is experimental and may change in future versions.
 
-    Subclass it and pass an instance to :class:`HarborPlugin`. Every method
-    has a default, so override only what the worker needs. For each attempt,
-    the Activity:
+    Subclass it and pass an instance to
+    :class:`temporalio.harbor.HarborPlugin`. Every method has a default, so
+    override only what the worker needs. For each attempt, the Activity:
 
-    1. enters :meth:`scope`, and inside it
-    2. creates harbor's ``Trial`` and calls :meth:`trial_created` with it,
-    3. runs the trial,
-    4. if the trial recorded an exception, asks :meth:`retry` whether to run
-       it again, raising out of the scope if so, and otherwise
-    5. calls :meth:`output` and returns what it gives beside the result.
+    1. waits for any earlier attempt of the same trial on this worker to
+       finish, then deletes the trial's directory,
+    2. enters :meth:`scope`, and inside it
+    3. creates harbor's ``Trial`` and calls :meth:`trial_created` with it,
+    4. runs the trial, and if harbor produced a result,
+    5. passes its text through :meth:`redact` and calls :meth:`output`.
 
-    Hooks run on the worker, so they may do I/O.
+    The Activity returns the redacted result with what :meth:`output` gave.
+    It raises instead, and Temporal retries the trial, when the trial could
+    not run for a reason other than its configuration, failed before its
+    agent started, or its agent's run ended in a transient provider error
+    (see :func:`temporalio.harbor.execute_trial`).
+
+    Hooks run on the worker's event loop, beside every other trial the worker
+    is running, so do I/O with ``async`` libraries or ``asyncio.to_thread``.
+    Together, the async hooks of one attempt may spend the ``extra_time``
+    given to :func:`temporalio.harbor.execute_trial`; a hook that runs past
+    it fails the attempt for Temporal to retry.
     """
 
     def scope(self, context: TrialContext) -> AbstractAsyncContextManager[None]:  # type: ignore[reportUnusedParameter]
@@ -81,10 +76,15 @@ class TrialHooks:
 
         Use it for setup the trial depends on, and for cleanup that must run
         however the attempt ends. An exception leaving the scope is how the
-        attempt ends early: an ``ApplicationError`` when :meth:`retry` asks
-        for another attempt, ``asyncio.CancelledError`` when the trial is
-        cancelled, or whatever made the trial fail before harbor could record
-        a result. Re-raise it; a scope that suppresses it fails the attempt.
+        attempt ends early: an ``ApplicationError`` from :meth:`output`, or
+        from the Activity when Temporal is to run the trial again or when
+        :meth:`output` or :meth:`redact` failed; ``asyncio.CancelledError``
+        when the attempt is cancelled, including when the worker shuts down
+        or the Activity is paused; or whatever made the trial fail before
+        harbor could record a result. It reaches Temporal as it leaves the
+        scope, so a scope may raise its own exception from it. A scope that
+        suppresses an exception fails the attempt anyway when the trial
+        produced no result.
 
         The default does nothing.
         """
@@ -97,37 +97,55 @@ class TrialHooks:
         does nothing.
         """
 
-    def retry(self, result: TrialResult, context: TrialContext) -> TrialRetry | None:
-        """Decide whether to run a trial that recorded an exception again.
-
-        Called only when ``result.exception_info`` is set and the Activity has
-        attempts left under its retry policy. On the last attempt the result
-        is returned instead, so a recorded failure is never lost.
-
-        The default is harbor's own decision for ``context.retry``: the same
-        ``include_exceptions`` and ``exclude_exceptions``, the same
-        ``max_retries``, and the same backoff, from harbor's ``TrialQueue``.
-        Override it to change the decision for some failures and call
-        ``super().retry(result, context)`` for the rest.
-
-        Returns:
-            When to run the trial again, or ``None`` to return this result.
-        """
-        exc = result.exception_info
-        if exc is None or context.attempt > context.retry.max_retries:
-            return None
-        if not _compat.should_retry_exception(context.retry, exc.exception_type):
-            return None
-        # Harbor counts attempts from 0; this is the delay after that attempt.
-        delay = _compat.backoff_delay_sec(context.retry, context.attempt - 1)
-        return TrialRetry(delay=timedelta(seconds=delay))
-
     async def output(self, result: TrialResult, context: TrialContext) -> JsonValue:  # type: ignore[reportUnusedParameter]
         """Produce what the Activity returns beside the trial's result.
 
-        Called with the complete result, before it is slimmed, for the
-        attempt whose result is returned. What it returns reaches the workflow
-        as :attr:`TrialOutcome.output`, through workflow history, so keep it
-        small. The default returns ``None``.
+        Called with harbor's complete result, unredacted, for every attempt
+        that produced one, including one that records an exception. What it
+        returns reaches the workflow as
+        :attr:`temporalio.harbor.TrialOutcome.output`, through workflow
+        history and without passing through :meth:`redact`, so keep it small
+        and free of secrets.
+
+        To have Temporal run the trial again, raise an ``ApplicationError``;
+        its type, message, ``non_retryable`` and ``next_retry_delay`` are
+        yours to choose. The Activity attaches the attempt's outcome to its
+        details, so when Temporal stops retrying,
+        :func:`temporalio.harbor.execute_trial` returns the most recent
+        outcome any attempt produced. Any other exception, or a return value
+        that cannot be converted to JSON or that brings the outcome past
+        about 2 MB, fails the attempt without a retry, and
+        :func:`temporalio.harbor.execute_trial` returns the attempt's outcome
+        without an ``output``.
+
+        The default returns ``None``.
         """
         return None
+
+    def redact(self, text: str, context: TrialContext) -> str:  # type: ignore[reportUnusedParameter]
+        """Rewrite text before it leaves the worker for Temporal history.
+
+        Called on every string value in a trial's result, before long
+        exception text is shortened, and on the message and stack trace of
+        every error the attempt raises, causes included. Use it to remove
+        credentials or paths that harbor recorded. It runs on the event loop
+        and must not block.
+
+        It does not see dictionary keys, what :meth:`output` returns, the
+        details of an ``ApplicationError`` a hook raises, or the text
+        :func:`temporalio.harbor.aggregate_job` reads from a result, which
+        reaches the workflow as harbor recorded it: the result's
+        ``trial_name``, ``task_name``, ``source`` and ``started_at``, its
+        agent's name and model name, and the type of its recorded exception.
+        A value in the result that is not free text, such as a UUID, a
+        timestamp or a host the agent is allowed to reach, keeps the value
+        harbor recorded when the rewritten text is not valid for it.
+
+        If it raises or returns something other than a ``str``, the attempt
+        fails without a retry and sends none of its error's text, and
+        :func:`temporalio.harbor.execute_trial` returns the most recent
+        outcome any attempt produced, if there is one.
+
+        The default returns ``text`` unchanged.
+        """
+        return text

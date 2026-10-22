@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import timedelta
 
-from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.converter import DataConverter
+from temporalio.contrib.pydantic import (
+    PydanticPayloadConverter,
+    pydantic_data_converter,
+)
+from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.harbor._activity import HarborActivities
 from temporalio.harbor._hooks import TrialHooks
 from temporalio.plugin import SimplePlugin
@@ -21,38 +23,35 @@ class HarborPlugin(SimplePlugin):
 
     Registers the Activities that :func:`temporalio.harbor.plan_job`,
     :func:`temporalio.harbor.execute_trial` and
-    :func:`temporalio.harbor.aggregate_job` schedule. Harbor's configuration
-    and results are pydantic models, so the plugin installs Temporal's pydantic
-    data converter unless a custom converter is already configured.
+    :func:`temporalio.harbor.aggregate_job` schedule, and passes harbor
+    through the workflow sandbox. Harbor's configuration and results are
+    pydantic models, so the plugin makes Temporal's pydantic payload converter
+    the data converter's payload converter, keeping any payload codec and
+    failure converter. A custom payload converter is left in place.
 
     Register it on the Client, so both workflows and the starter use the same
     converter, and it is applied to every Worker built from that Client.
     """
 
-    def __init__(
-        self,
-        *,
-        heartbeat_interval: timedelta = timedelta(seconds=30),
-        trial_hooks: TrialHooks | None = None,
-    ) -> None:
+    def __init__(self, *, trial_hooks: TrialHooks | None = None) -> None:
         """Create the plugin.
 
         Args:
-            heartbeat_interval: How often a running trial heartbeats. Must be
-                well under the ``heartbeat_timeout`` given to
-                :func:`temporalio.harbor.execute_trial`.
             trial_hooks: How this worker takes part in running each trial.
                 Defaults to :class:`temporalio.harbor.TrialHooks`, which runs
-                trials as ``harbor run`` does, retries included.
+                each trial as harbor's own ``Trial`` runs it.
         """
         activities = HarborActivities(
-            heartbeat_interval=heartbeat_interval,
-            hooks=trial_hooks if trial_hooks is not None else TrialHooks(),
+            hooks=trial_hooks if trial_hooks is not None else TrialHooks()
         )
 
         def data_converter(converter: DataConverter | None) -> DataConverter:
-            if converter is None or converter == DataConverter.default:
+            if converter is None:
                 return pydantic_data_converter
+            if converter.payload_converter_class is DefaultPayloadConverter:
+                return dataclasses.replace(
+                    converter, payload_converter_class=PydanticPayloadConverter
+                )
             return converter
 
         def workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
@@ -71,9 +70,9 @@ class HarborPlugin(SimplePlugin):
             name="HarborPlugin",
             data_converter=data_converter,
             activities=[
-                activities.resolve_job,
+                activities.plan_job,
                 activities.run_trial,
-                activities.compute_metrics,
+                activities.aggregate_job,
             ],
             workflow_runner=workflow_runner,
         )

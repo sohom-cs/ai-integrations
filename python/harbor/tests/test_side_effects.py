@@ -5,10 +5,14 @@ from __future__ import annotations
 import sys
 import uuid
 from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from harbor import telemetry
 from harbor.models.job.config import JobConfig
+from harbor.models.job.result import JobResult
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig
 
 from temporalio.client import Client
@@ -46,17 +50,17 @@ async def test_one_schedule_per_trial(harbor_client: Client, tmp_path: Path) -> 
             id=f"job-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        stats = await handle.result()
+        result = await handle.result()
 
-    assert stats.n_completed_trials == 4
+    assert result.stats.n_completed_trials == 4
     events = await history.scheduled(handle)
     by_type = Counter(
         e.activity_task_scheduled_event_attributes.activity_type.name for e in events
     )
     assert by_type == {
-        "harbor.resolve_job": 1,
+        "harbor.plan_job": 1,
         "harbor.run_trial": 4,
-        "harbor.compute_metrics": 1,
+        "harbor.aggregate_job": 1,
     }
     ids = {e.activity_task_scheduled_event_attributes.activity_id for e in events}
     assert len(ids) == len(events)
@@ -85,3 +89,43 @@ async def test_trial_names_are_stable_across_replay(
         == "harbor.run_trial"
     ]
     assert returned == scheduled
+
+
+def _ticking_clock(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    """Make JobConfig's clock move on at every read; return the reads."""
+    reads: list[datetime] = []
+
+    def now() -> datetime:
+        reads.append(datetime(2026, 1, 1) + timedelta(hours=len(reads)))
+        return reads[-1]
+
+    monkeypatch.setattr("harbor.models.job.config.datetime", SimpleNamespace(now=now))
+    return reads
+
+
+async def test_unnamed_job_keeps_one_directory_across_replay(
+    harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As a job file without job_name starts it: JobConfig takes a name from
+    # the clock in workflow code, and again on every replay.
+    reads = _ticking_clock(monkeypatch)
+    config = _config(tmp_path).model_dump(mode="json", exclude={"job_name"})
+    async with new_worker(harbor_client, RunJob, max_cached_workflows=0) as worker:
+        result = await harbor_client.execute_workflow(
+            "RunJob",
+            config,
+            id=f"job-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            result_type=JobResult,
+        )
+
+    assert len(reads) > 1
+    [job_dir] = (tmp_path / "jobs").iterdir()
+    assert sorted(p.name for p in job_dir.iterdir()) == sorted(
+        ["config.json", "lock.json", "result.json"]
+        + [trial.trial_name for trial in result.trial_results]
+    )
+
+
+def test_harbor_telemetry_is_off() -> None:
+    assert telemetry._telemetry_disabled()

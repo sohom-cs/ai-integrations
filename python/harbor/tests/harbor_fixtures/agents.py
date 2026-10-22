@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from harbor.agents.base import BaseAgent
+from harbor.agents.installed import base as installed
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 TRANSCRIPT_AGENT = "tests.harbor_fixtures.agents:TranscriptAgent"
+FAILING_AGENT = "tests.harbor_fixtures.agents:FailingAgent"
 TOKENS = 4_000
 
 
@@ -40,3 +44,26 @@ class TranscriptAgent(BaseAgent):
             }
         ]
         context.metadata = {"transcript": "x" * 50_000}
+
+
+class FailingAgent(BaseAgent):
+    """Ends every run with the harbor agent error that ``error`` names."""
+
+    def __init__(self, *args: Any, error: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._error: type[Exception] = getattr(installed, error)
+
+    @staticmethod
+    def name() -> str:
+        return "failing"
+
+    def version(self) -> str:
+        return "1.0.0"
+
+    async def setup(self, environment: BaseEnvironment) -> None:
+        pass
+
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        raise self._error(f"the agent's run ended in {self._error.__name__}")

@@ -9,7 +9,8 @@ from typing import Any
 
 import pytest
 from harbor.job import Job
-from harbor.models.job.config import JobConfig
+from harbor.models.job.config import DatasetConfig, JobConfig
+from harbor.models.job.lock import JobLock
 from harbor.models.job.result import JobStats
 from harbor.models.metric.config import MetricConfig
 from harbor.models.metric.type import MetricType
@@ -19,9 +20,10 @@ from harbor.models.trial.config import (
     TaskConfig,
     TrialConfig,
 )
+from harbor.viewer.scanner import JobScanner
 
 from temporalio.client import Client
-from tests.harbor_fixtures import history, tasks
+from tests.harbor_fixtures import agents, history, tasks
 from tests.harbor_fixtures.workflows import RunJob, RunOneTrial, TrialArgs, new_worker
 
 pytestmark = pytest.mark.skipif(
@@ -29,17 +31,21 @@ pytestmark = pytest.mark.skipif(
     reason="the local test environment runs task scripts with bash",
 )
 
+_ATTEMPTS = 3
 
-def _job(
-    jobs_dir: Path, task_list: list[TaskConfig], metrics: list[MetricConfig]
-) -> JobConfig:
+
+def _job(jobs_dir: Path, root: Path, metrics: list[MetricConfig]) -> JobConfig:
     return JobConfig(
         job_name="fidelity",
         jobs_dir=jobs_dir,
         quiet=True,
-        tasks=task_list,
-        n_attempts=2,
-        agents=[AgentConfig(name="oracle")],
+        datasets=[DatasetConfig(path=root / "ds-a")],
+        tasks=[TaskConfig(path=root / "no-reward", source="ds-b")],
+        n_attempts=_ATTEMPTS,
+        agents=[
+            AgentConfig(name="oracle"),
+            AgentConfig(import_path=agents.TRANSCRIPT_AGENT, model_name="test/model"),
+        ],
         environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
         metrics=metrics,
     )
@@ -63,81 +69,72 @@ def _comparable(stats: JobStats) -> dict[str, Any]:
     return data
 
 
-def _expected(metric: str, values: tuple[float, float]) -> dict[str, Any]:
-    ds_a, ds_b = values
-    return {
-        "n_completed_trials": 6,
-        "n_running_trials": 0,
-        "n_pending_trials": 0,
-        "n_cancelled_trials": 0,
-        "n_errored_trials": 2,
-        "n_retries": 0,
-        "n_input_tokens": None,
-        "n_cache_tokens": None,
-        "n_output_tokens": None,
-        "cost_usd": None,
-        "evals": {
-            "oracle__ds-a": {
-                "n_trials": 4,
-                "n_errors": 0,
-                "metrics": [{metric: ds_a}],
-                "pass_at_k": {"2": 0.5},
-                "reward_stats": {
-                    "reward": {
-                        "0.0": ["stays-silent", "stays-silent"],
-                        "1.0": ["answers", "answers"],
-                    }
-                },
-                "exception_stats": {},
-            },
-            "oracle__ds-b": {
-                "n_trials": 0,
-                "n_errors": 2,
-                "metrics": [{metric: ds_b}],
-                "pass_at_k": {"2": 0.0},
-                "reward_stats": {},
-                "exception_stats": {
-                    "RewardFileNotFoundError": ["no-reward", "no-reward"]
-                },
-            },
-        },
-    }
-
-
 @pytest.mark.parametrize(
-    ("metrics", "expected"),
-    [
-        ([], _expected("mean", (0.5, 0.0))),
-        ([MetricConfig(type=MetricType.MAX)], _expected("max", (1.0, 0.0))),
-    ],
+    "metrics",
+    [[], [MetricConfig(type=MetricType.MAX)]],
     ids=["dataset-default", "job-metric"],
 )
 async def test_plugin_job_matches_harbor_job(
-    harbor_client: Client,
-    tmp_path: Path,
-    metrics: list[MetricConfig],
-    expected: dict[str, Any],
+    harbor_client: Client, tmp_path: Path, metrics: list[MetricConfig]
 ) -> None:
     root = tmp_path / "tasks"
-    task_list = [
-        TaskConfig(path=tasks.passing(root), source="ds-a"),
-        TaskConfig(path=tasks.failing(root), source="ds-a"),
-        TaskConfig(path=tasks.no_reward(root), source="ds-b"),
-    ]
+    tasks.passing(root / "ds-a")
+    tasks.failing(root / "ds-a")
+    tasks.no_reward(root)
 
-    job = await Job.create(_job(tmp_path / "harbor", task_list, metrics))
-    reference = await job.run()
+    reference = await (await Job.create(_job(tmp_path / "harbor", root, metrics))).run()
 
     async with new_worker(harbor_client, RunJob) as worker:
-        stats = await harbor_client.execute_workflow(
+        result = await harbor_client.execute_workflow(
             RunJob.run,
-            _job(tmp_path / "plugin", task_list, metrics),
+            _job(tmp_path / "plugin", root, metrics),
             id=f"job-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
 
-    assert _comparable(stats) == _comparable(reference.stats)
-    assert _comparable(stats) == expected
+    assert _comparable(result.stats) == _comparable(reference.stats)
+    stats = result.stats
+    n_trials = 3 * 2 * _ATTEMPTS
+    assert (stats.n_completed_trials, stats.n_errored_trials, stats.n_retries) == (
+        n_trials,
+        2 * _ATTEMPTS,
+        0,
+    )
+    # Only the transcript agent reports usage, once per trial it ran.
+    assert stats.n_input_tokens == 3 * _ATTEMPTS * agents.TOKENS
+    assert stats.cost_usd == pytest.approx(3 * _ATTEMPTS * 0.25)
+    assert len(stats.evals) == 4
+    assert all(evals.metrics for evals in stats.evals.values())
+    assert result.n_total_trials == n_trials
+    assert len(result.trial_results) == n_trials
+
+    # Harbor's own tools read the plugin's job directory as they read harbor's.
+    plugin = JobScanner(tmp_path / "plugin")
+    harbor = JobScanner(tmp_path / "harbor")
+    plugin_config = plugin.get_job_config("fidelity")
+    harbor_config = harbor.get_job_config("fidelity")
+    assert plugin_config is not None and harbor_config is not None
+    assert plugin_config.model_copy(update={"jobs_dir": Path()}) == (
+        harbor_config.model_copy(update={"jobs_dir": Path()})
+    )
+    plugin_result = plugin.get_job_result("fidelity")
+    harbor_result = harbor.get_job_result("fidelity")
+    assert plugin_result is not None and harbor_result is not None
+    assert plugin_result.id == result.id
+    assert plugin_result.n_total_trials == harbor_result.n_total_trials
+    assert plugin_result.finished_at is not None
+    assert _comparable(plugin_result.stats) == _comparable(harbor_result.stats)
+
+    job_dir = tmp_path / "plugin" / "fidelity"
+    harbor_dir = tmp_path / "harbor" / "fidelity"
+    assert JobLock.model_validate_json((job_dir / "lock.json").read_text()) == (
+        JobLock.model_validate_json((harbor_dir / "lock.json").read_text())
+    )
+    names = sorted(r.trial_name for r in result.trial_results)
+    assert plugin.list_trials("fidelity") == names
+    assert sorted(p.name for p in job_dir.iterdir()) == sorted(
+        ["config.json", "lock.json", "result.json", *names]
+    )
 
 
 async def test_activity_summaries(harbor_client: Client, tmp_path: Path) -> None:

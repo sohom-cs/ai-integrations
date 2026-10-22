@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncGenerator
-from datetime import timedelta
 from functools import partial
 from pathlib import Path
 
@@ -21,6 +20,9 @@ from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+
+# Harbor sends anonymous usage reports unless this is off.
+os.environ["HARBOR_TELEMETRY"] = "0"
 
 
 def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
@@ -82,7 +84,7 @@ async def client(env: WorkflowEnvironment) -> Client:
 async def harbor_client(client: Client) -> Client:
     """A client with the harbor plugin, as a user would configure one."""
     config = client.config()
-    config["plugins"] = [HarborPlugin(heartbeat_interval=timedelta(milliseconds=200))]
+    config["plugins"] = [HarborPlugin()]
     return Client(**config)
 
 

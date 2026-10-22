@@ -1,8 +1,7 @@
 """Tiny harbor tasks, written to a temporary directory per test.
 
 Each task's solution and verifier are bash scripts that find the trial's
-``/logs`` through ``$HARBOR_LOGS`` (see ``local_env``), so they would also run
-unchanged in a real container.
+``/logs`` through ``$HARBOR_LOGS`` (see ``local_env``).
 """
 
 from __future__ import annotations
@@ -10,6 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 
 LOCAL_ENV = "tests.harbor_fixtures.local_env:LocalEnvironment"
+NO_CREDENTIALS_ENV = "tests.harbor_fixtures.local_env:NoCredentialsEnvironment"
+UNSTARTABLE_ENV = "tests.harbor_fixtures.local_env:UnstartableEnvironment"
+UNSTOPPABLE_ENV = "tests.harbor_fixtures.local_env:UnstoppableEnvironment"
 
 _TASK_TOML = """\
 version = "1.0"
@@ -71,7 +73,7 @@ def flaky(root: Path, failures: int, name: str = "flaky") -> Path:
     """The verifier writes no reward on its first ``failures`` runs, then grades.
 
     The run count lives beside the task, outside any trial directory, so it
-    survives a retry that sets the previous attempt's directory aside.
+    survives a retry, which deletes the previous attempt's directory.
     """
     counter = root / f"{name}.runs"
     test = (
@@ -84,3 +86,31 @@ def flaky(root: Path, failures: int, name: str = "flaky") -> Path:
 def slow(root: Path, seconds: float, name: str = "slow") -> Path:
     """The agent's solution is correct but takes ``seconds`` to write."""
     return _task(root, name, solve=f"sleep {seconds}\n" + _WRITE_ANSWER, test=_GRADE)
+
+
+def held(root: Path, waiting: Path, release: Path, name: str = "held") -> Path:
+    """The agent's solution is correct, but written only once ``release`` exists.
+
+    The agent creates ``waiting``, then waits without output, for about 30
+    seconds at most.
+    """
+    hold = (
+        f'touch "{waiting}"\n'
+        f'for _ in $(seq 600); do [ -e "{release}" ] && break; sleep 0.05; done\n'
+    )
+    return _task(root, name, solve=hold + _WRITE_ANSWER, test=_GRADE)
+
+
+def two_steps(root: Path, name: str = "two-steps", *, ready: bool = True) -> Path:
+    """Two steps, each graded as :func:`passing` grades.
+
+    Unless ``ready``, the first step's healthcheck fails, before its agent starts.
+    """
+    task = _task(root, name, solve=_WRITE_ANSWER, test=_GRADE)
+    toml = _TASK_TOML + '\n[[steps]]\nname = "one"\n'
+    if not ready:
+        toml += '\n[steps.healthcheck]\ncommand = "false"\nretries = 1\n'
+    (task / "task.toml").write_text(toml + '\n[[steps]]\nname = "two"\n')
+    for step in ("one", "two"):
+        _task(task / "steps", step, solve=_WRITE_ANSWER, test=_GRADE)
+    return task
