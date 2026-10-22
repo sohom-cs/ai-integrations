@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 
 import nexusrpc.handler
 import pytest
+from langchain_core.env import get_runtime_environment
+from langchain_core.runnables import RunnableLambda
 from langsmith import traceable, tracing_context
 
 from temporalio import activity, common, nexus, workflow
@@ -77,6 +79,29 @@ class TraceableActivityWorkflow:
             start_to_close_timeout=timedelta(minutes=1),
             retry_policy=common.RetryPolicy(maximum_attempts=1),
         )
+
+
+@workflow.defn
+class LangChainRunnableWorkflow:
+    """Runs a LangChain runnable in workflow code; its last step calls an activity."""
+
+    @workflow.run
+    async def run(self, _input: str = "") -> str:
+        # Async steps: a sync step would run in an executor, which workflows lack.
+        async def prepare(prompt: str) -> str:
+            return prompt
+
+        async def call_activity(_prompt: str) -> str:
+            return await workflow.execute_activity(
+                traceable_activity,
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=common.RetryPolicy(maximum_attempts=1),
+            )
+
+        chain = RunnableLambda(prepare, name="prepare") | RunnableLambda(
+            call_activity, name="call_activity"
+        )
+        return await chain.ainvoke("hello")
 
 
 @nexusrpc.handler.service_handler
@@ -394,39 +419,66 @@ class TestBasicTracing:
 
 
 class TestReplay:
+    @pytest.mark.parametrize(
+        ("workflow_cls", "expected"),
+        [
+            # Workflow→activity→@traceable flow
+            (
+                TraceableActivityWorkflow,
+                [
+                    "StartWorkflow:TraceableActivityWorkflow",
+                    "RunWorkflow:TraceableActivityWorkflow",
+                    "  StartActivity:traceable_activity",
+                    "  RunActivity:traceable_activity",
+                    "    traceable_activity",
+                    "      inner_llm_call",
+                ],
+            ),
+            # LangChain's tracer writes these runs, not @traceable
+            (
+                LangChainRunnableWorkflow,
+                [
+                    "StartWorkflow:LangChainRunnableWorkflow",
+                    "RunWorkflow:LangChainRunnableWorkflow",
+                    "  RunnableSequence",
+                    "    prepare",
+                    "    call_activity",
+                    "      StartActivity:traceable_activity",
+                    "      RunActivity:traceable_activity",
+                    "        traceable_activity",
+                    "          inner_llm_call",
+                ],
+            ),
+        ],
+    )
     async def test_no_duplicate_traces_on_replay(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        workflow_cls: Any,
+        expected: list[str],
     ) -> None:
         """With max_cached_workflows=0 (forcing replay), no duplicate runs appear."""
+        # LangChain's tracer reads the runtime environment, which the workflow
+        # sandbox blocks until it is cached outside it.
+        get_runtime_environment()
         temporal_client, collector, _ = _make_client_and_collector(
             client, add_temporal_runs=True
         )
 
         async with new_worker(
             temporal_client,
-            TraceableActivityWorkflow,
+            workflow_cls,
             activities=[traceable_activity],
             max_cached_workflows=0,
         ) as worker:
             handle = await temporal_client.start_workflow(
-                TraceableActivityWorkflow.run,
+                workflow_cls.run,
                 id=f"replay-test-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
             )
             await handle.result()
 
-        # Workflow→activity→@traceable flow should produce exactly these runs
-        # with no duplicates from replay:
-        expected = [
-            "StartWorkflow:TraceableActivityWorkflow",
-            "RunWorkflow:TraceableActivityWorkflow",
-            "  StartActivity:traceable_activity",
-            "  RunActivity:traceable_activity",
-            "    traceable_activity",
-            "      inner_llm_call",
-        ]
         assert_trace_hierarchy(build_trace_trees(collector), expected)
 
 

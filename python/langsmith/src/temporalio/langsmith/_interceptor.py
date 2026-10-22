@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, ClassVar, NoReturn, Protocol
 
 import langsmith
@@ -67,7 +68,7 @@ def _inject_context(
     into a Temporal header under ``_temporal-langsmith-context``, enabling parent-child
     trace nesting across process boundaries (client → worker, workflow → activity).
     """
-    ls_headers = run_tree.to_headers()
+    ls_headers = _run_headers(run_tree)
     return {
         **headers,
         HEADER_KEY: _payload_converter.to_payloads([ls_headers])[0],
@@ -117,7 +118,7 @@ def _inject_nexus_context(
     run_tree: RunTree,
 ) -> dict[str, str]:
     """Inject LangSmith context into Nexus string headers."""
-    ls_headers = run_tree.to_headers()
+    ls_headers = _run_headers(run_tree)
     return {
         **headers,
         HEADER_KEY: json.dumps(ls_headers),
@@ -240,6 +241,176 @@ def _get_workflow_random() -> random.Random | None:
 def _uuid_from_random(rng: random.Random) -> uuid.UUID:
     """Generate a deterministic UUID4 from a workflow-bound random generator."""
     return uuid.UUID(int=rng.getrandbits(128), version=4)
+
+
+# ---------------------------------------------------------------------------
+# Replay safety for LangChain tracer runs
+# ---------------------------------------------------------------------------
+
+
+class _LangChainRuns:
+    """Stable IDs for the runs LangChain's tracer makes in one workflow.
+
+    LangChain gives each run a random ID and a wall-clock start time, so a
+    replay would make the same runs again as new ones.  This maps each run's
+    ID to one from a workflow-seeded generator, and its start time to
+    ``workflow.now()``.  The generator is separate from
+    ``_get_workflow_random`` so the plugin's own run IDs do not change.
+    """
+
+    def __init__(self) -> None:
+        self._rng = random.Random()
+        self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
+        # Posts skipped during replay, for runs that are still open.
+        self.pending: dict[uuid.UUID, dict[str, Any]] = {}
+
+        def reseed(seed: int) -> None:
+            self._rng.seed(f"temporal-langsmith-langchain-{seed}")
+
+        reseed(temporalio.workflow.random_seed())
+        temporalio.workflow.register_random_seed_callback(reseed)
+
+    def add(self, run_id: Any) -> uuid.UUID:
+        """Give a run a stable ID and start time, once, and return the ID."""
+        entry = self._ids.get(str(run_id))
+        if entry is None:
+            entry = (_uuid_from_random(self._rng), temporalio.workflow.now())
+            self._ids[str(run_id)] = entry
+        return entry[0]
+
+    def stable_id(self, run_id: Any) -> Any:
+        """Get a run's stable ID, or ``run_id`` for a run this class does not know."""
+        entry = self._ids.get(str(run_id))
+        return run_id if entry is None else entry[0]
+
+    def dotted_order(self, dotted_order: str) -> str:
+        """Rewrite each ``<start time><run ID>`` segment this class knows."""
+        segments = []
+        for segment in dotted_order.split("."):
+            entry = self._ids.get(segment[-36:])
+            if entry is not None:
+                segment = entry[1].strftime("%Y%m%dT%H%M%S%fZ") + str(entry[0])
+            segments.append(segment)
+        return ".".join(segments)
+
+    def relink(self, run: RunTree) -> None:
+        """Point a run at the stable IDs of the runs above it."""
+        run.parent_run_id = self.stable_id(run.parent_run_id)
+        run.trace_id = self.stable_id(run.trace_id)
+        run.dotted_order = self.dotted_order(run.dotted_order)
+
+    def remap(self, kwargs: dict[str, Any], id_key: str) -> uuid.UUID | None:
+        """Rewrite a run write's IDs in place and return the run's stable ID.
+
+        Returns ``None``, leaving ``kwargs`` alone, for a run this class
+        does not know.
+        """
+        entry = self._ids.get(str(kwargs.get(id_key)))
+        if entry is None:
+            return None
+        for key in (id_key, "parent_run_id", "trace_id"):
+            if kwargs.get(key) is not None:
+                kwargs[key] = self.stable_id(kwargs[key])
+        if kwargs.get("start_time") is not None:
+            kwargs["start_time"] = entry[1]
+        if kwargs.get("dotted_order"):
+            kwargs["dotted_order"] = self.dotted_order(kwargs["dotted_order"])
+        return entry[0]
+
+
+def _get_langchain_runs() -> _LangChainRuns | None:
+    """Get the current workflow's ``_LangChainRuns``.
+
+    Returns ``None`` outside a workflow, in read-only (query) contexts, or
+    when workflow APIs are mocked (unit tests).
+    """
+    try:
+        if not temporalio.workflow.in_workflow():
+            return None
+        if temporalio.workflow.unsafe.is_read_only():
+            return None
+        inst = temporalio.workflow.instance()
+        runs = getattr(inst, "__temporal_langsmith_langchain_runs", None)
+        if runs is None:
+            runs = _LangChainRuns()
+            setattr(inst, "__temporal_langsmith_langchain_runs", runs)
+        return runs
+    except Exception:
+        return None
+
+
+def _run_headers(run_tree: RunTree) -> dict[str, str]:
+    """Get a run's LangSmith headers, with stable IDs in workflow code."""
+    ls_headers = run_tree.to_headers()
+    runs = _get_langchain_runs()
+    if runs is not None and "langsmith-trace" in ls_headers:
+        ls_headers["langsmith-trace"] = runs.dotted_order(ls_headers["langsmith-trace"])
+    return ls_headers
+
+
+class _ReplaySafeClient:
+    """Wraps the plugin's LangSmith client for use in workflow code.
+
+    LangChain's tracer writes its runs through this client, not through
+    ``_ReplaySafeRunTree``.  In workflow code, this gives those runs stable
+    IDs (see ``_LangChainRuns``), skips their writes while history replays,
+    and at the first write after a replay posts the replayed runs that are
+    still open and that this client has not posted, as after a worker
+    restart.  Other calls, and writes from other threads such as
+    ``_ReplaySafeRunTree``'s background I/O, go to the wrapped client as is.
+    """
+
+    def __init__(self, client: langsmith.Client) -> None:
+        """Wrap a LangSmith client."""
+        self._client = client
+        # Runs this client posted from workflow code that have not ended.
+        self._open: set[uuid.UUID] = set()
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate attribute access to the wrapped client."""
+        return getattr(self._client, name)
+
+    def create_run(self, *args: Any, **kwargs: Any) -> None:
+        """Post a run, replay-safe in workflow code."""
+        runs = _get_langchain_runs()
+        if runs is None or args or kwargs.get("id") is None:
+            return self._client.create_run(*args, **kwargs)
+        run_id = runs.add(kwargs["id"])
+        runs.remap(kwargs, "id")
+        ended = kwargs.get("end_time") is not None
+        if _is_replaying():
+            if not ended:
+                runs.pending[run_id] = kwargs
+            return None
+        self._post_pending(runs)
+        self._client.create_run(**kwargs)
+        if not ended:
+            self._open.add(run_id)
+        return None
+
+    def update_run(self, *args: Any, **kwargs: Any) -> None:
+        """Update a run, replay-safe in workflow code."""
+        runs = _get_langchain_runs()
+        run_id = None if runs is None or args else runs.remap(kwargs, "run_id")
+        if runs is None or run_id is None:
+            return self._client.update_run(*args, **kwargs)
+        ended = kwargs.get("end_time") is not None
+        if _is_replaying():
+            if ended:
+                runs.pending.pop(run_id, None)
+            return None
+        self._post_pending(runs)
+        self._client.update_run(**kwargs)
+        if ended:
+            self._open.discard(run_id)
+        return None
+
+    def _post_pending(self, runs: _LangChainRuns) -> None:
+        for run_id, kwargs in runs.pending.items():
+            if run_id not in self._open:
+                self._client.create_run(**kwargs)
+                self._open.add(run_id)
+        runs.pending.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +564,10 @@ class _RootReplaySafeRunTreeFactory(_ReplaySafeRunTree):
             factory_run.session_name = session_name
         if replicas is not None:
             factory_run.replicas = replicas
+        # LangChain's tracer makes the factory its runs' parent.
+        runs = _get_langchain_runs()
+        if runs is not None:
+            runs.add(factory_run.id)
         object.__setattr__(self, "_run", factory_run)
         object.__setattr__(self, "_executor", executor)
 
@@ -544,7 +719,12 @@ def _maybe_run(
         run_tree_args["extra"] = {"metadata": metadata}
     if tags:
         run_tree_args["tags"] = tags
-    run_tree = _ReplaySafeRunTree(RunTree(**run_tree_args), executor=executor)
+    run = RunTree(**run_tree_args)
+    # The parent may be one of LangChain's runs, which have stable IDs.
+    runs = _get_langchain_runs()
+    if runs is not None:
+        runs.relink(run)
+    run_tree = _ReplaySafeRunTree(run, executor=executor)
     run_tree.post()
     try:
         with tracing_context(parent=run_tree, client=client):
@@ -599,6 +779,8 @@ class LangSmithInterceptor(
         if client is None:
             client = langsmith.Client()
         self._client = client
+        # Workflow code uses this wherever it would use a langsmith.Client.
+        self._workflow_client: Any = _ReplaySafeClient(client)
         self._project_name = project_name
         self._add_temporal_runs = add_temporal_runs
         self._default_metadata = default_metadata or {}
@@ -617,7 +799,9 @@ class LangSmithInterceptor(
         """Create a LangSmith run with this interceptor's config already applied."""
         metadata = {**self._default_metadata, **(extra_metadata or {})}
         with _maybe_run(
-            self._client,
+            self._workflow_client
+            if temporalio.workflow.in_workflow()
+            else self._client,
             name,
             add_temporal_runs=self._add_temporal_runs,
             run_type=run_type,
@@ -806,8 +990,9 @@ class _LangSmithWorkflowInboundInterceptor(
         code can discover the parent and LangSmith client, independent of the
         ``add_temporal_runs`` toggle.
         """
+        client = self._config._workflow_client
         parent = (
-            _extract_context(headers, self._config._executor, self._config._client)
+            _extract_context(headers, self._config._executor, client)
             if headers
             else None
         )
@@ -821,13 +1006,13 @@ class _LangSmithWorkflowInboundInterceptor(
             parent
             if parent is not None or self._config._add_temporal_runs
             else _RootReplaySafeRunTreeFactory(
-                ls_client=self._config._client,
+                ls_client=client,
                 executor=self._config._executor,
                 session_name=self._config._project_name,
             )
         )
         tracing_args: dict[str, Any] = {
-            "client": self._config._client,
+            "client": client,
             "project_name": self._config._project_name,
             "parent": tracing_parent,
         }
