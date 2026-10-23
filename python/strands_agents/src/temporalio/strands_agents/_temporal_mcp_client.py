@@ -131,6 +131,12 @@ class TemporalMCPClient(ToolProvider):
         return None
 
 
+def _field(obj: Any, snake: str, camel: str) -> Any:
+    """Read a field that mcp 2 renamed from camelCase to snake_case."""
+    value = getattr(obj, snake, None)
+    return value if value is not None else getattr(obj, camel, None)
+
+
 # Use the MCP session directly instead of MCPClient's background-thread
 # helpers. Those helpers route calls through cross-loop futures that are
 # unreliable on Python 3.10 when invoked from Temporal's async worker/activity
@@ -145,7 +151,7 @@ async def _paginate_list_tools(session: ClientSession) -> list[Tool]:
             else None
         )
         tools.extend(page.tools)
-        pagination_token = page.nextCursor
+        pagination_token = _field(page, "next_cursor", "nextCursor")
         if pagination_token is None:
             return tools
 
@@ -168,8 +174,8 @@ def _tool_infos(client: MCPClient, tools: Sequence[Tool]) -> list[_MCPToolInfo]:
             _MCPToolInfo(
                 name=tool.name,
                 description=tool.description or "",
-                input_schema=tool.inputSchema,
-                output_schema=tool.outputSchema,
+                input_schema=_field(tool, "input_schema", "inputSchema"),
+                output_schema=_field(tool, "output_schema", "outputSchema"),
             )
         )
     return infos
