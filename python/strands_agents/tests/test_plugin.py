@@ -16,12 +16,17 @@ from temporalio.client import ClientConfig
 from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import (
     DataConverter,
+    DefaultFailureConverter,
     DefaultFailureConverterWithEncodedAttributes,
     PayloadCodec,
+    PayloadConverter,
 )
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin
-from temporalio.strands_agents._failure_converter import StrandsFailureConverter
+from temporalio.strands_agents._failure_converter import (
+    StrandsFailureConverter,
+    StrandsFailureConverterWithEncodedAttributes,
+)
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from tests.mock_model import MockModel
@@ -122,12 +127,20 @@ def test_custom_payload_converter_is_preserved() -> None:
     assert configured is supplied
 
 
-@pytest.mark.parametrize("target", ["client", "replayer"])
-def test_caller_failure_converter_is_kept(target: str) -> None:
-    supplied = replace(
-        DataConverter.default,
-        failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
-    )
+class DomainError(Exception):
+    pass
+
+
+class DomainFailureConverter(DefaultFailureConverter):
+    def from_failure(
+        self, failure: Failure, payload_converter: PayloadConverter
+    ) -> BaseException:
+        if failure.application_failure_info.type == "DomainError":
+            return DomainError(failure.message)
+        return super().from_failure(failure, payload_converter)
+
+
+def _configure(target: str, supplied: DataConverter) -> DataConverter:
     plugin = StrandsPlugin(models={})
     configured: DataConverter | None
     if target == "client":
@@ -137,13 +150,28 @@ def test_caller_failure_converter_is_kept(target: str) -> None:
             {"data_converter": supplied, "workflow_runner": SandboxedWorkflowRunner()}
         ).get("data_converter")
     assert configured is not None
+    return configured
 
-    # The caller's converter still encodes failure messages.
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_caller_encoded_failure_converter_is_kept(target: str) -> None:
+    supplied = replace(
+        DataConverter.default,
+        failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+    )
+    configured = _configure(target, supplied)
+
+    # The caller's encoding still applies to failure messages.
     failure = Failure()
     configured.failure_converter.to_failure(
         ApplicationError("secret"), configured.payload_converter, failure
     )
     assert failure.message == "Encoded failure"
+    decoded = configured.failure_converter.from_failure(
+        failure, configured.payload_converter
+    )
+    assert isinstance(decoded, ApplicationError)
+    assert decoded.message == "secret"
 
     # The Strands handling is added on top of it.
     interrupt = Failure()
@@ -155,3 +183,34 @@ def test_caller_failure_converter_is_kept(target: str) -> None:
     assert interrupt.application_failure_info.type == "StrandsInterrupt"
     assert interrupt.application_failure_info.non_retryable
     assert interrupt.message == "Encoded failure"
+
+    assert (
+        configured.failure_converter_class
+        is StrandsFailureConverterWithEncodedAttributes
+    )
+    # A second plugin pass, as a Worker built from the Client makes, keeps it.
+    assert _configure(target, configured).failure_converter_class is (
+        StrandsFailureConverterWithEncodedAttributes
+    )
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_other_failure_converter_is_replaced(target: str) -> None:
+    # Keeping this class would change which errors Workflow code reads, and so
+    # break the replay of existing histories.
+    supplied = replace(
+        DataConverter.default, failure_converter_class=DomainFailureConverter
+    )
+    configured = _configure(target, supplied)
+    assert configured.failure_converter_class is StrandsFailureConverter
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        ApplicationError("boom", type="DomainError"),
+        configured.payload_converter,
+        failure,
+    )
+    decoded = configured.failure_converter.from_failure(
+        failure, configured.payload_converter
+    )
+    assert isinstance(decoded, ApplicationError)
+    assert decoded.type == "DomainError"
