@@ -1,15 +1,21 @@
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
 
 from strands import Agent
 from strands.hooks import BeforeModelCallEvent, HookCallback
 
+from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._temporal_mcp_client import TemporalMCPClient
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
+
+# Runs that started before the plugin read the worker-side model's config keep
+# an empty config, so their history has no config activity.
+_MODEL_CONFIG_PATCH = "strands-model-config"
 
 _SNAPSHOT_DISABLED = (
     "TemporalAgent disables take_snapshot()/load_snapshot(). Temporal "
@@ -80,6 +86,7 @@ class TemporalAgent(Agent):
             streaming_batch_interval=streaming_batch_interval,
         )
         super().__init__(model=temporal_model, sandbox=sandbox, **agent_kwargs)
+        self._temporal_model = temporal_model
 
         # Strands invokes ToolProvider.load_tools() once at construction on a
         # separate run_async thread that has no workflow runtime, so a
@@ -125,6 +132,20 @@ class TemporalAgent(Agent):
                 reg.replace(tool)
             else:
                 reg.register_tool(tool)
+
+    async def stream_async(
+        self, prompt: Any = None, **kwargs: Any
+    ) -> AsyncIterator[Any]:
+        """Load the worker-side model's config, then run Strands' ``stream_async``.
+
+        Strands reads the model's context window limit for proactive
+        compression and its model id for tracing in workflow code, before the
+        first model call.
+        """
+        if workflow.patched(_MODEL_CONFIG_PATCH):
+            await self._temporal_model._load_config()
+        async for event in super().stream_async(prompt, **kwargs):
+            yield event
 
     def take_snapshot(self, *_args: Any, **_kwargs: Any) -> Any:
         """Disabled; Temporal's event history is the source of truth."""
