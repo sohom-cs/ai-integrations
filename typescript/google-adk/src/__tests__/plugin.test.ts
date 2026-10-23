@@ -12,7 +12,7 @@ import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
 import { GoogleAdkPlugin } from '../index';
 import { interceptors as autoRouteInterceptors } from '../auto-route';
 import { interceptors as polyfillInterceptors } from '../load-polyfills';
-import { mockMCPToolset } from '../testing';
+import { fakeModelProvider, mockMCPToolset } from '../testing';
 import { sandboxCompatResolveHook } from './helpers';
 
 interface NamedPlugin {
@@ -240,4 +240,39 @@ test('configureWorker registers model activities, plus the four MCP activities p
   t.is(typeof activities['weather-callTool'], 'function');
   t.is(typeof activities['weather-listResources'], 'function');
   t.is(typeof activities['weather-readResource'], 'function');
+});
+
+test('configureWorker refuses to replace a different Activity with the same name', (t) => {
+  const provider = fakeModelProvider();
+  const weather = mockMCPToolset([]);
+  const base = { taskQueue: 'tq' } as WorkerOptions;
+  const duplicate = (name: string) => ({
+    instanceOf: TypeError,
+    message: new RegExp(`^Duplicate registration of Activity '${name}': GoogleAdkPlugin would replace`),
+  });
+
+  // A caller Activity, another instance's model provider, or another instance's
+  // toolset factory under the same name is refused.
+  const callerActivities = { ...base, activities: { 'adk-invokeModel': async () => 'caller' } };
+  t.throws(() => new GoogleAdkPlugin().configureWorker(callerActivities), duplicate('adk-invokeModel'));
+  const withProvider = new GoogleAdkPlugin({ modelProvider: provider }).configureWorker(base);
+  t.throws(() => new GoogleAdkPlugin().configureWorker(withProvider), duplicate('adk-invokeModel'));
+  const withToolset = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather } }).configureWorker(base);
+  const otherToolset = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather: mockMCPToolset([]) } });
+  t.throws(() => otherToolset.configureWorker(withToolset), duplicate('weather-listTools'));
+
+  // The same instance twice (NativeConnection and Worker), or the same options
+  // twice, still registers.
+  const plugin = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather } });
+  t.notThrows(() => plugin.configureWorker(plugin.configureWorker(base)));
+  t.notThrows(() => new GoogleAdkPlugin().configureWorker(new GoogleAdkPlugin().configureWorker(base)));
+  t.notThrows(() =>
+    new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather } }).configureWorker(withToolset)
+  );
+  // Different toolset names from two instances are both kept.
+  const both = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { news: mockMCPToolset([]) } })
+    .configureWorker(withToolset)
+    .activities as Record<string, unknown>;
+  t.is(typeof both['weather-callTool'], 'function');
+  t.is(typeof both['news-callTool'], 'function');
 });

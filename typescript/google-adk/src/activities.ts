@@ -37,6 +37,7 @@ import {
   MCP_TOOL_NOT_FOUND_FAILURE_TYPE,
   MODEL_ERROR_FAILURE_TYPE,
 } from './error-types';
+import { withSources } from './activity-sources';
 import type { InvokeModelArgs, InvokeModelStreamingArgs, ModelActivities, WireLlmRequest } from './model';
 import type { MCPCallToolArgs, MCPReadResourceArgs, MCPResourceContents, MCPToolsetFactory } from './mcp';
 
@@ -91,7 +92,7 @@ export interface ModelActivitiesOptions {
 export function createModelActivities(options: ModelActivitiesOptions = {}): ModelActivities {
   const resolveModel = (model: string): BaseLlm => options.modelProvider?.(model) ?? LLMRegistry.newLlm(model);
 
-  return {
+  const activities: ModelActivities = {
     async 'adk-invokeModel'(args: InvokeModelArgs): Promise<LlmResponse[]> {
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
@@ -144,6 +145,7 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
       }
     },
   };
+  return withSources(activities, [options.modelProvider]);
 }
 
 /**
@@ -155,7 +157,7 @@ export function createMCPActivities(
 ): Record<string, (args: never) => Promise<unknown>> {
   const activities: Record<string, (args: never) => Promise<unknown>> = {};
   for (const [name, factory] of Object.entries(toolsets)) {
-    Object.assign(activities, mcpActivitiesForName(name, factory));
+    Object.assign(activities, withSources(mcpActivitiesForName(name, factory), [factory]));
   }
   return activities;
 }
