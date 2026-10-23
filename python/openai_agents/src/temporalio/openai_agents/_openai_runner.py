@@ -163,10 +163,12 @@ def _multi_provider_settings(provider: MultiProvider) -> dict[str, Any]:
         for name, value in vars(provider).items()
         if name not in caches and name != "openai_provider"
     }
+    openai_settings = vars(provider.openai_provider)
+    if "_stored_api_key" in openai_settings:
+        # No client was passed, so ``_client`` caches the one built on first use.
+        caches.add("_client")
     settings["openai_provider"] = {
-        name: value
-        for name, value in vars(provider.openai_provider).items()
-        if name not in caches
+        name: value for name, value in openai_settings.items() if name not in caches
     }
     return settings
 

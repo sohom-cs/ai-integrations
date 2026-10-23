@@ -1843,6 +1843,17 @@ class RunModelProviderWorkflow:
         return result.final_output
 
 
+def test_reused_default_model_provider_is_not_refused(monkeypatch: pytest.MonkeyPatch):
+    from temporalio.openai_agents._openai_runner import _is_default_model_provider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    provider = MultiProvider()
+    # A native run fills the OpenAI provider's client cache; that is not configuration.
+    provider.get_model("gpt-4o")
+    assert _is_default_model_provider(provider)
+    assert not _is_default_model_provider(MultiProvider(openai_use_responses=False))
+
+
 @pytest.mark.parametrize("provider", ["custom", "configured"])
 async def test_run_model_provider_refused(client: Client, provider: str):
     async with AgentEnvironment(model=hello_mock_model()) as env:
