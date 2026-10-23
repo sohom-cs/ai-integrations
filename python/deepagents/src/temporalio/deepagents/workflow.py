@@ -147,13 +147,10 @@ async def call_tool(
     )
     if hit:
         return _activity.ToolActivityOutput(message=cached)
-    if not activity_input.tagged_args:
-        # Encode after the legacy lookup: legacy cache keys hash the raw args.
-        activity_input = dataclasses.replace(
-            activity_input,
-            args=_serde.dump_tool_args(activity_input.args),
-            tagged_args=True,
-        )
+    activity_input = dataclasses.replace(
+        activity_input,
+        arg_messages=_serde.find_tool_arg_messages(activity_input.args),
+    )
     output = await workflow.execute_activity(
         _activity.INVOKE_TOOL,
         activity_input,

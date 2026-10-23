@@ -169,9 +169,10 @@ A wrapped tool gets LangChain messages in its arguments as message objects, as
 it does without Temporal. For example, `state["messages"]` from `InjectedState`
 holds `HumanMessage` and `AIMessage` objects, not dicts. This covers the message
 classes in `langchain_core.messages` and their chunks; a subclass you define
-still arrives as a dict. Update activity workers before or together with
-workflow workers: an older activity worker passes the messages to the tool in
-their encoded form.
+still arrives as a dict. Values inside a message, such as a `ToolMessage`
+artifact, keep their JSON form, so a `Document` artifact arrives as a dict.
+Update activity workers before or together with workflow workers: an older
+activity worker still passes the messages to the tool as dicts.
 
 ## Durable file and shell backends
 

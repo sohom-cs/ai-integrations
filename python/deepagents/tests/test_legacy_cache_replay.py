@@ -173,7 +173,7 @@ class LegacyReplayCanDedupMessagesWorkflow:
         from temporalio.deepagents import run_deep_agent
 
         # A wrapped tool whose arguments hold a message: the legacy key must
-        # hash them as recorded, not in the activity input's encoded form.
+        # hash them as recorded.
         wrapped = tool_as_activity(
             legacy_replay_last_message, start_to_close_timeout=timedelta(seconds=10)
         )
