@@ -4,6 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime, get_runtime
 from pydantic import BaseModel, Field
@@ -192,24 +193,40 @@ async def test_two_nodes(
 class ModelState(BaseModel):
     value: str
     answer: Answer | None = None
+    messages: list[BaseMessage] = []
     state_type_a: str = ""
     state_type_b: str = ""
     answer_type_b: str = ""
+    message_b: str = ""
 
 
 async def model_node_a(state: ModelState) -> dict[str, Any]:
-    return {"answer": Answer(value=1), "state_type_a": type(state).__name__}
-
-
-async def model_node_b(state: ModelState) -> dict[str, str]:
     return {
-        "state_type_b": type(state).__name__,
-        "answer_type_b": type(getattr(state, "answer", None)).__name__,
+        "answer": Answer(value=1),
+        "messages": [
+            AIMessage(
+                content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
+            )
+        ],
+        "state_type_a": type(state).__name__,
     }
 
 
+async def model_node_b(state: ModelState) -> dict[str, str]:
+    message = state.messages[-1]
+    tool_calls = getattr(message, "tool_calls", [{}])
+    return {
+        "state_type_b": type(state).__name__,
+        "answer_type_b": type(getattr(state, "answer", None)).__name__,
+        "message_b": f"{type(message).__name__}:{tool_calls[0].get('name')}",
+    }
+
+
+@pytest.mark.parametrize("pydantic_converter", [False, True])
 @pytest.mark.parametrize("first_node_execution", ["activity", "workflow"])
-async def test_two_nodes_pydantic_state(client: Client, first_node_execution: str):
+async def test_two_nodes_pydantic_state(
+    client: Client, first_node_execution: str, pydantic_converter: bool
+):
     g = StateGraph(ModelState)
     g.add_node("node_a", model_node_a, metadata={"execute_in": first_node_execution})
     g.add_node("node_b", model_node_b, metadata={"execute_in": "activity"})
@@ -217,6 +234,10 @@ async def test_two_nodes_pydantic_state(client: Client, first_node_execution: st
     g.add_edge("node_a", "node_b")
 
     task_queue = f"my-graph-{uuid4()}"
+    if pydantic_converter:
+        client_config = client.config()
+        client_config["data_converter"] = pydantic_data_converter
+        client = Client(**client_config)
     async with Worker(
         client,
         task_queue=task_queue,
@@ -237,10 +258,12 @@ async def test_two_nodes_pydantic_state(client: Client, first_node_execution: st
             task_queue=task_queue,
         )
 
+    assert result.pop("messages")[0]["tool_calls"][0]["name"] == "search"
     assert result == {
         "value": "",
         "answer": {"value": 1},
         "state_type_a": "ModelState",
         "state_type_b": "ModelState",
         "answer_type_b": "Answer",
+        "message_b": "AIMessage:search",
     }

@@ -157,7 +157,7 @@ For Pydantic v2 contexts, configure `temporalio.contrib.pydantic.pydantic_data_c
 
 Activity nodes and tasks get their arguments, and return their results, with the same types as in native LangGraph. After a value crosses the Activity boundary, the plugin rebuilds:
 
-- Pydantic models and dataclasses found in a registered graph's schemas or in a node's or task's type hints, including the types those reference
+- Pydantic models and dataclasses found in a registered graph's schemas or in a node's or task's type hints, including the types those reference and their subclasses, also when nested in another value, such as an `AIMessage` in a `list[BaseMessage]` field
 - LangChain messages
 - `bytes`
 - `Command`s in a list a node returns, as `ToolNode` does when a tool returns a `Command`

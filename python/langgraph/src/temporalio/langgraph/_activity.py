@@ -2,10 +2,13 @@
 
 import asyncio
 import dataclasses
-from collections.abc import Awaitable, Iterable, Iterator, Sequence
+import typing
+from collections.abc import Awaitable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import cache
 from inspect import iscoroutinefunction, signature
+from types import UnionType
 from typing import (
     Annotated,
     Any,
@@ -20,7 +23,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command, Interrupt, Send, TimeoutPolicy
 from pydantic import BaseModel
-from typing_extensions import is_typeddict
+from typing_extensions import NotRequired, Required, is_typeddict
 
 from temporalio import activity, workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
@@ -125,8 +128,12 @@ def _command_from_payload(payload: dict[str, Any]) -> Command:
 
 
 _COMMAND_TYPE_ID = "langgraph.types.Command"
-# Marks the type ID of a node in the tree ValueTypes.restore builds from paths.
+# Keys in the tree ValueTypes.restore builds from paths: a node's type ID and
+# the value sent on its own for it.
 _TYPE_ID = object()
+_SENT = object()
+_MISSING = object()
+_UNIONS = (typing.Union, UnionType)  # pyright: ignore[reportDeprecated]
 
 
 def _subclasses(cls: type) -> Iterator[type]:
@@ -142,6 +149,107 @@ def _type_hints(obj: Any) -> list[Any]:
         return []
 
 
+@cache
+def _class_hints(cls: Any) -> dict[str, Any]:
+    try:
+        return get_type_hints(cls, include_extras=True)
+    except Exception:
+        return {}
+
+
+def _unwrap(hint: Any) -> Any:
+    while get_origin(hint) in (Annotated, Required, NotRequired):
+        hint = get_args(hint)[0]
+    return hint
+
+
+def _field_hint(owner: Any, name: str) -> Any:
+    if isinstance(owner, BaseModel):
+        field = type(owner).model_fields.get(name)
+        return field.annotation if field else Any
+    cls: Any = type(owner)
+    return _class_hints(cls).get(name, Any)
+
+
+def _item_hint(hint: Any, key: str | int) -> Any:
+    """Return the declared type of an item in a container of type ``hint``."""
+    hint = _unwrap(hint)
+    origin = get_origin(hint)
+    args = [arg for arg in get_args(hint) if arg is not type(None)]
+    if origin in _UNIONS:
+        return _item_hint(args[0], key) if len(args) == 1 else Any
+    if is_typeddict(hint):
+        return _class_hints(hint).get(str(key), Any)
+    if origin is tuple:
+        if len(args) == 2 and args[1] is Ellipsis:
+            return args[0]
+        return args[key] if isinstance(key, int) and key < len(args) else Any
+    if isinstance(origin, type) and issubclass(origin, Mapping):
+        return args[1] if len(args) == 2 else Any
+    if isinstance(origin, type) and issubclass(origin, Iterable) and args:
+        return args[0]
+    return Any
+
+
+def _written_as_base(value: Any, hint: Any) -> bool:
+    """Whether a serializer following ``hint`` writes ``value`` as a base class.
+
+    Pydantic writes a value of a subclass of the declared class with the
+    declared class's fields only.
+    """
+    hint = _unwrap(hint)
+    members = get_args(hint) if get_origin(hint) in _UNIONS else (hint,)
+    classes = tuple(
+        m for m in map(_unwrap, members) if isinstance(m, type) and m is not Any
+    )
+    return bool(classes) and type(value) not in classes and isinstance(value, classes)
+
+
+def _children(node: dict[Any, Any]) -> list[Any]:
+    return [key for key in node if key is not _TYPE_ID and key is not _SENT]
+
+
+def _get(owner: Any, key: str | int) -> Any:
+    try:
+        if isinstance(owner, (dict, list, tuple)):
+            return owner[key]  # type: ignore[index]
+        return getattr(owner, str(key))
+    except (KeyError, IndexError, AttributeError, TypeError):
+        return _MISSING
+
+
+def _put(owner: Any, key: str | int, value: Any) -> Any:
+    if isinstance(owner, tuple):
+        index = int(key)
+        return (*owner[:index], value, *owner[index + 1 :])
+    if isinstance(owner, (dict, list)):
+        owner[key] = value  # type: ignore[index]
+    elif (
+        isinstance(owner, BaseModel) and owner.model_extra and key in owner.model_extra
+    ):
+        owner.model_extra[str(key)] = value
+    else:
+        object.__setattr__(owner, str(key), value)
+    return owner
+
+
+def _plain_item(plain: Any, owner: Any, key: str | int) -> Any:
+    """Return the plain JSON the converter wrote for ``owner``'s item ``key``."""
+    if isinstance(plain, list):
+        return plain[key] if isinstance(key, int) and key < len(plain) else _MISSING
+    if not isinstance(plain, dict):
+        return _MISSING
+    if key in plain:
+        return plain[key]
+    field = (
+        type(owner).model_fields.get(str(key)) if isinstance(owner, BaseModel) else None
+    )
+    for alias in (field.serialization_alias, field.alias) if field else ():
+        if alias in plain:
+            return plain[alias]
+    return _MISSING
+
+
 class ValueTypes:
     """Keep the types of node and task values across the Activity boundary.
 
@@ -149,11 +257,15 @@ class ValueTypes:
     converter decodes them as plain JSON. The sender records where values of
     known classes sit, by class ID, and the receiver rebuilds them with the
     payload converter, as for an Activity parameter of that class. Values are
-    encoded as before, so older payloads and readers are unaffected.
+    encoded as before, so older payloads and readers are unaffected. Values
+    inside a rebuilt value are recorded too and put back when the converter
+    rebuilds them with another class, such as an ``AIMessage`` in a
+    ``list[BaseMessage]`` field. Pydantic writes such a value with the declared
+    class's fields only, so it is also sent on its own.
 
     Known classes are ``bytes``, LangChain messages, and the Pydantic models
-    and dataclasses reachable from the given schemas and function signatures.
-    Only these are rebuilt.
+    and dataclasses reachable from the given schemas and function signatures,
+    with their subclasses. Only these are rebuilt.
     """
 
     def __init__(
@@ -183,8 +295,11 @@ class ValueTypes:
                 continue
             if issubclass(hint, BaseModel):
                 stack.extend(field.annotation for field in hint.model_fields.values())
+                if hint is not BaseModel:
+                    stack.extend(_subclasses(hint))
             elif dataclasses.is_dataclass(hint):
                 stack.extend(_type_hints(hint))
+                stack.extend(_subclasses(hint))
             elif hint is not bytes:
                 if is_typeddict(hint):
                     stack.extend(_type_hints(hint))
@@ -217,6 +332,7 @@ class ValueTypes:
         type_id = self._type_id(type(value))
         if type_id is not None:
             value_types.append([path, type_id])
+            self._record(value, path, value_types, Any)
             return value
         if isinstance(value, dict):
             items = {
@@ -236,26 +352,87 @@ class ValueTypes:
             return elements if changed else value
         return value
 
+    def _record(
+        self, value: Any, path: list[str | int], value_types: list[Any], hint: Any
+    ) -> None:
+        """Record known values inside ``value``, which the converter writes whole."""
+        items: list[tuple[str | int, Any, Any]]
+        if isinstance(value, BaseModel):
+            items = [
+                (name, getattr(value, name), _field_hint(value, name))
+                for name in type(value).model_fields
+            ]
+            items += [
+                (key, item, Any) for key, item in (value.model_extra or {}).items()
+            ]
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            items = [
+                (field.name, getattr(value, field.name), _field_hint(value, field.name))
+                for field in dataclasses.fields(value)
+            ]
+        elif isinstance(value, dict):
+            items = [
+                (key, item, _item_hint(hint, key))
+                for key, item in value.items()
+                if isinstance(key, str)
+            ]
+        elif isinstance(value, (list, tuple)):
+            items = [
+                (index, item, _item_hint(hint, index))
+                for index, item in enumerate(value)
+            ]
+        else:
+            return
+        for key, item, item_hint in items:
+            item_path = [*path, key]
+            type_id = self._type_id(type(item))
+            if type_id is not None:
+                entry = [item_path, type_id]
+                if _written_as_base(item, item_hint):
+                    entry.append(item)
+                value_types.append(entry)
+            self._record(item, item_path, value_types, item_hint)
+
     def restore(
         self, value: Any, value_types: list[Any], converter: PayloadConverter
     ) -> Any:
         """Rebuild the values ``encode`` recorded, leaving ``value`` unchanged."""
         tree: dict[Any, Any] = {}
-        for path, type_id in value_types:
+        for path, type_id, *sent in value_types:
             node = tree
             for key in path:
                 node = node.setdefault(key, {})
             node[_TYPE_ID] = type_id
+            if sent:
+                node[_SENT] = sent[0]
 
         def rebuild(value: Any, node: dict[Any, Any]) -> Any:
-            children = [key for key in node if key is not _TYPE_ID]
+            """Rebuild a value from its plain JSON."""
+            type_id = node.get(_TYPE_ID)
+            if type_id is not None and type_id != _COMMAND_TYPE_ID:
+                return fix(self._rebuild(type_id, value, converter), value, node)
+            children = _children(node)
             if children:
                 value = dict(value) if isinstance(value, dict) else list(value)
                 for key in children:
                     value[key] = rebuild(value[key], node[key])
-            if _TYPE_ID in node:
-                value = self._rebuild(node[_TYPE_ID], value, converter)
-            return value
+            return value if type_id is None else _command_from_payload(value)
+
+        def fix(current: Any, plain: Any, node: dict[Any, Any]) -> Any:
+            """Put back values the converter rebuilt with another class."""
+            plain = node.get(_SENT, plain)
+            type_id = node.get(_TYPE_ID)
+            if type_id is not None and type(current) is not self._classes.get(type_id):
+                return rebuild(plain, node)
+            for key in _children(node):
+                item = _get(current, key)
+                item_plain = _plain_item(plain, current, key)
+                if item is _MISSING or item_plain is _MISSING:
+                    continue
+                fixed = fix(item, item_plain, node[key])
+                if fixed is not item:
+                    current = _put(current, key, fixed)
+            return current
 
         return rebuild(value, tree)
 
