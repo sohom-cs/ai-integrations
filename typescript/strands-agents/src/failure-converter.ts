@@ -7,7 +7,7 @@ import {
   type ProtoFailure,
   type SerializationContext,
 } from '@temporalio/common';
-import { inWorkflowContext, patched } from '@temporalio/workflow';
+import { inWorkflowContext, patched, workflowInfo } from '@temporalio/workflow';
 
 export const STRANDS_INTERRUPT_TYPE = 'StrandsInterrupt';
 
@@ -85,17 +85,31 @@ export const failureConverter: FailureConverter = new StrandsFailureConverter();
 export const CALLER_FAILURE_CONVERTER_PATCH = 'strands-agents.caller-failure-converter';
 
 // Workflow module state, so one copy per workflow run.
-let composed = false;
+let callerConverter: FailureConverter | undefined;
+let decided = false;
 let callerDecodesInWorkflow = false;
+// The SDK decodes the previous run's failure (`workflowInfo().lastFailure`) while it initializes a
+// run, before the decision below can be made.
+let earlyDecode:
+  | { failure: ProtoFailure; payloadConverter: PayloadConverter; context?: SerializationContext; error: Error }
+  | undefined;
 
 /**
  * Decide, when a workflow run starts, whether its workflow code decodes failures with the caller's
  * failure converter. Called by the plugin's workflow interceptor; does nothing without a caller
- * converter.
+ * converter. In a run that does, `workflowInfo().lastFailure` is decoded again with the caller's
+ * converter, before workflow code reads it.
  */
 export function decideCallerFailureConverter(): void {
-  if (composed) {
-    callerDecodesInWorkflow = patched(CALLER_FAILURE_CONVERTER_PATCH);
+  if (callerConverter === undefined || decided) return;
+  decided = true;
+  callerDecodesInWorkflow = patched(CALLER_FAILURE_CONVERTER_PATCH);
+  const early = earlyDecode;
+  earlyDecode = undefined;
+  // `workflowInfo()` returns the run's info object; there is no public setter for `lastFailure`.
+  const info = workflowInfo() as unknown as { lastFailure?: Error };
+  if (callerDecodesInWorkflow && early !== undefined && info.lastFailure === early.error) {
+    info.lastFailure = callerConverter.failureToError(early.failure, early.payloadConverter, early.context);
   }
 }
 
@@ -109,15 +123,18 @@ export function decideCallerFailureConverter(): void {
  * {@link CALLER_FAILURE_CONVERTER_PATCH}; others keep {@link StrandsFailureConverter}.
  */
 export function composeFailureConverter(caller: FailureConverter): FailureConverter {
-  composed = true;
+  callerConverter = caller;
   return {
     errorToFailure(err, payloadConverter, context) {
       return caller.errorToFailure(rewriteChain(err), payloadConverter, context);
     },
     failureToError(failure, payloadConverter, context) {
-      return !inWorkflowContext() || callerDecodesInWorkflow
-        ? caller.failureToError(failure, payloadConverter, context)
-        : failureConverter.failureToError(failure, payloadConverter, context);
+      if (!inWorkflowContext() || callerDecodesInWorkflow) {
+        return caller.failureToError(failure, payloadConverter, context);
+      }
+      const error = failureConverter.failureToError(failure, payloadConverter, context);
+      if (!decided) earlyDecode = { failure, payloadConverter, context, error };
+      return error;
     },
   };
 }

@@ -4,7 +4,7 @@ import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, helpers, TestWorkflowEnvironment } from '@temporalio/test-helpers';
 import { StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
-import { failTwice } from './workflows/strands';
+import { failTwice, lastFailureOfRetry } from './workflows/strands';
 
 // Its own file, so the second workflow bundle this test builds lives in its own test process and
 // does not add to the memory the main suite's concurrent workers use.
@@ -32,10 +32,15 @@ test("a worker's own failure converter still applies with the plugin", async (t)
       },
     },
   });
-  const history = await worker.runUntil(async () => {
+  const [history, lastFailure] = await worker.runUntil(async () => {
     const handle = await startWorkflow(failTwice, { args: ['workflow failed'] });
     await t.throwsAsync(handle.result());
-    return await handle.fetchHistory();
+    // The SDK decodes a retried run's last failure before the run starts; it still gets the
+    // caller's converter.
+    const retried = await startWorkflow(lastFailureOfRetry, {
+      retry: { maximumAttempts: 2, initialInterval: '10 milliseconds' },
+    });
+    return [await handle.fetchHistory(), await retried.result()] as const;
   });
 
   // Both failures were stored as the caller's converter writes them, and Strands still marked the
@@ -46,7 +51,7 @@ test("a worker's own failure converter still applies with the plugin", async (t)
     ?.workflowExecutionFailedEventAttributes?.failure;
   const cause = workflowFailure?.cause?.applicationFailureInfo;
   t.deepEqual(
-    [activityFailure?.message, workflowFailure?.message, cause?.type, cause?.nonRetryable],
-    ['Encoded failure', 'Encoded failure', 'StructuredOutputError', true]
+    [activityFailure?.message, workflowFailure?.message, cause?.type, cause?.nonRetryable, lastFailure],
+    ['Encoded failure', 'Encoded failure', 'StructuredOutputError', true, 'decoded by the caller']
   );
 });

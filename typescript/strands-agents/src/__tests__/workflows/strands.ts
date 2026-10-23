@@ -8,7 +8,14 @@ import {
   type InterruptResponseContent,
   type InterruptResponseContentData,
 } from '@strands-agents/sdk';
-import { ApplicationFailure, defineSignal, proxyActivities, setHandler, condition } from '@temporalio/workflow';
+import {
+  ApplicationFailure,
+  defineSignal,
+  proxyActivities,
+  setHandler,
+  condition,
+  workflowInfo,
+} from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalAgent, TemporalMCPClient, type TemporalAgentOptions, workflow as strandsWorkflow } from '../..';
 
@@ -174,6 +181,14 @@ export async function failTwice(message: string): Promise<never> {
   });
   await failingActivity(message).catch(() => undefined);
   throw ApplicationFailure.create({ message, nonRetryable: true, cause: new StructuredOutputError('no output') });
+}
+
+/** Fails its first attempt with a `Custom` failure; the retry returns how it sees that failure. */
+export async function lastFailureOfRetry(): Promise<string | undefined> {
+  if (workflowInfo().attempt === 1) {
+    throw ApplicationFailure.create({ message: 'first attempt failed', type: 'Custom' });
+  }
+  return workflowInfo().lastFailure?.message;
 }
 
 export const approveSignal = defineSignal<[string]>('approve');
