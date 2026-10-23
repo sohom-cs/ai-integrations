@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import threading
+import types
 import typing
 import warnings
 from collections.abc import (
@@ -18,6 +19,7 @@ from contextvars import Token
 from datetime import timedelta
 from weakref import WeakKeyDictionary
 
+import openai
 import pydantic
 from agents import ModelProvider, Trace, set_trace_provider
 from agents.mcp import MCPServer
@@ -209,14 +211,33 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     """Build ``value`` into ``type_`` without enforcing required fields.
 
     OpenAI's ``construct_type`` handles its own response models, but not the
-    ``TypedDict`` and ``agents`` dataclass layers that wrap them (e.g.
-    ``ActivityModelInput`` and ``ModelResponse``). Walk those containers here,
-    then delegate their leaves to ``construct_type``. ``include_extras``
-    preserves the ``Annotated`` discriminators the unions rely on.
+    ``TypedDict``, dataclass and caller Pydantic model layers that wrap them (e.g.
+    ``ActivityModelInput``, ``ModelResponse`` or a Workflow result holding
+    ``raw_responses``). Walk those containers here, then delegate their leaves to
+    ``construct_type``. ``include_extras`` preserves the ``Annotated``
+    discriminators the unions rely on.
     """
     origin = typing.get_origin(type_)
     if origin in (Required, NotRequired):
         return _lenient_construct(typing.get_args(type_)[0], value)
+    if origin in (typing.Union, types.UnionType):  # pyright: ignore[reportDeprecated]
+        # Optional fields and the ``str | list[...]`` input field: build the only
+        # variant that fits.
+        if value is None:
+            return None
+        variants = [
+            arg
+            for arg in typing.get_args(type_)
+            if arg is not type(None) and _may_hold(arg, value)
+        ]
+        if len(variants) == 1:
+            return _lenient_construct(variants[0], value)
+        try:
+            return construct_type(type_=type_, value=value)
+        except TypeError:
+            # construct_type caches discriminated unions by weak reference, which
+            # ``X | Y`` unions do not support. Keep the decoded value.
+            return value
     if is_typeddict(type_) and isinstance(value, dict):
         hints = typing.get_type_hints(type_, include_extras=True)
         return {
@@ -241,7 +262,50 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
                 if field.name in value
             }
         )
+    if (
+        isinstance(type_, type)
+        and issubclass(type_, pydantic.BaseModel)
+        and not issubclass(type_, openai.BaseModel)
+        and isinstance(value, dict)
+    ):
+        hints = typing.get_type_hints(type_, include_extras=True)
+        fields: dict[str, typing.Any] = {}
+        for name, field in type_.model_fields.items():
+            key = (
+                field.alias
+                if field.alias is not None and field.alias in value
+                else name
+            )
+            if key in value:
+                fields[name] = _lenient_construct(hints.get(name, object), value[key])
+        return type_.model_construct(**fields)
     return construct_type(type_=type_, value=value)
+
+
+def _may_hold(type_: typing.Any, value: typing.Any) -> bool:
+    """Whether a union variant could hold ``value``, judged by its container type."""
+    origin = typing.get_origin(type_) or type_
+    if origin is typing.Annotated:
+        return _may_hold(typing.get_args(type_)[0], value)
+    if origin in (typing.Union, types.UnionType):  # pyright: ignore[reportDeprecated]
+        return any(_may_hold(arg, value) for arg in typing.get_args(type_))
+    if isinstance(value, list):
+        return origin is list
+    if isinstance(value, dict):
+        return (
+            origin is dict
+            or is_typeddict(origin)
+            or (
+                isinstance(origin, type)
+                and (
+                    dataclasses.is_dataclass(origin)
+                    or issubclass(origin, pydantic.BaseModel)
+                )
+            )
+        )
+    if isinstance(value, str):
+        return origin is str or isinstance(origin, type) and issubclass(origin, str)
+    return True
 
 
 class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):

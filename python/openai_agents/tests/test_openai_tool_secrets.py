@@ -6,6 +6,7 @@ import uuid
 from collections.abc import AsyncIterator, Collection
 from typing import Any, cast
 
+import pydantic
 import pytest
 from agents import (
     Agent,
@@ -25,6 +26,7 @@ from agents import (
 )
 from agents.items import TResponseStreamEvent
 from agents.tool import ApplyPatchTool, ShellTool, ShellToolEnvironment
+from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -109,6 +111,83 @@ def test_lenient_activity_input_reconstructs_tools_and_handoffs():
     assert isinstance(tools[1], ApplyPatchTool)
     assert isinstance(tools[2], ShellTool)
     assert handoffs[0].agent_name == "helper"
+
+
+def test_lenient_activity_input_with_unvalidated_input_item():
+    # A function call item with an explicit None the next model input does not allow, as
+    # some model implementations write it. The tools must still decode as dataclasses.
+    activity_input: ActivityModelInput = {
+        "model_name": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{}",
+            }
+        ],
+        "model_settings": ModelSettings(),
+        "tools": [
+            FunctionToolInput(
+                name="get_weather",
+                description="Get the weather",
+                params_json_schema={"type": "object"},
+            )
+        ],
+        "tracing": ModelTracingInput.DISABLED,
+    }
+    converter = OpenAIPayloadConverter()
+    payload = converter.to_payload(activity_input)
+    raw = json.loads(payload.data)
+    raw["input"][0]["namespace"] = None
+    payload.data = json.dumps(raw).encode()
+
+    received = converter.from_payload(payload, ActivityModelInput)
+
+    assert isinstance(received["input"], list)
+    first_item: Any = received["input"][0]
+    assert first_item["namespace"] is None
+    received_tools = received.get("tools")
+    assert received_tools and isinstance(received_tools[0], FunctionToolInput)
+
+
+class _CallerResult(pydantic.BaseModel):
+    message: ResponseOutputMessage
+    responses: list[ModelResponse]
+    note: str | None = None
+
+
+def test_lenient_caller_model_keeps_its_type():
+    # An output_text part without annotations fails strict validation, as a drifted
+    # live response does. A caller's model holding it must still decode as that model.
+    message = ResponseOutputMessage(
+        id="msg_1",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(type="output_text", text="done", annotations=[])],
+    )
+    value = _CallerResult(
+        message=message,
+        responses=[ModelResponse(output=[message], usage=Usage(), response_id="r1")],
+        note="kept",
+    )
+    converter = OpenAIPayloadConverter()
+    payload = converter.to_payload(value)
+    raw = json.loads(payload.data)
+    del raw["message"]["content"][0]["annotations"]
+    del raw["responses"][0]["output"][0]["content"][0]["annotations"]
+    payload.data = json.dumps(raw).encode()
+
+    received = converter.from_payload(payload, _CallerResult)
+
+    assert isinstance(received, _CallerResult)
+    assert isinstance(received.message, ResponseOutputMessage)
+    assert isinstance(received.message.content[0], ResponseOutputText)
+    assert received.message.content[0].text == "done"
+    assert isinstance(received.responses[0], ModelResponse)
+    assert isinstance(received.responses[0].output[0], ResponseOutputMessage)
+    assert received.note == "kept"
 
 
 def test_build_tool_reports_unreconstructed_dict():
