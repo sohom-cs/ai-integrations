@@ -3,6 +3,7 @@ from typing import Any
 
 from strands import Agent
 from strands.hooks import BeforeModelCallEvent, HookCallback
+from strands.types.tools import AgentTool
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
@@ -104,9 +105,17 @@ class TemporalAgent(Agent):
         async def hook(event: BeforeModelCallEvent) -> None:
             if provider._cache_tools and provider._fetched:
                 return
-            old_names = {tool.tool_name for tool in provider._tools}
+            old_tools = {tool.tool_name: tool for tool in provider._tools}
+            fetched = provider._fetched
             await provider._refresh()
-            self._reconcile_mcp_tools(event, provider, old_names)
+            try:
+                self._reconcile_mcp_tools(event, provider, old_tools)
+            except ValueError:
+                # Keep the tools last accepted, so the next turn checks the
+                # refused names again instead of treating them as its own.
+                provider._tools = list(old_tools.values())
+                provider._fetched = fetched
+                raise
 
         return hook
 
@@ -114,28 +123,36 @@ class TemporalAgent(Agent):
         self,
         event: BeforeModelCallEvent,
         provider: TemporalMCPClient,
-        old_names: set[str],
+        old_tools: dict[str, AgentTool],
     ) -> None:
         reg = event.agent.tool_registry
         new = {tool.tool_name: tool for tool in provider._tools}
+
+        def owned(name: str) -> bool:
+            # The registry entry is still this provider's tool from its last
+            # listing; another tool may hold the same name.
+            return name in old_tools and reg.registry.get(name) is old_tools[name]
+
+        # A name another tool holds is refused, as Strands refuses it natively.
+        # Check before changing the registry.
+        taken = [name for name in new if name in reg.registry and not owned(name)]
+        if taken and workflow.patched(_REFUSE_DUPLICATE_TOOL_NAMES):
+            raise ValueError(
+                f"Tool name '{taken[0]}' already exists. Cannot register tools "
+                "with exact same name. Set a different prefix on the "
+                "MCPClient or drop the tool with tool_filters."
+            )
         # Tools the server dropped or renamed since the last listing. There is
-        # no public unregister, so remove them from the registry directly.
-        for name in old_names - set(new):
-            reg.registry.pop(name, None)
-            reg.dynamic_tools.pop(name, None)
-        # replace() swaps this provider's own tool in place (no hot-reload
-        # guard); register_tool() adds a newly-discovered one. A name another
-        # tool already holds is refused, as Strands refuses it natively.
+        # no public unregister, so remove them from the registry directly, but
+        # only while the entry is still this provider's.
+        for name in set(old_tools) - set(new):
+            if owned(name):
+                reg.registry.pop(name, None)
+                reg.dynamic_tools.pop(name, None)
+        # replace() swaps an existing entry in place (no hot-reload guard);
+        # register_tool() adds a newly-discovered one.
         for name, tool in new.items():
             if name in reg.registry:
-                if name not in old_names and workflow.patched(
-                    _REFUSE_DUPLICATE_TOOL_NAMES
-                ):
-                    raise ValueError(
-                        f"Tool name '{name}' already exists. Cannot register tools "
-                        "with exact same name. Set a different prefix on the "
-                        "MCPClient or drop the tool with tool_filters."
-                    )
                 reg.replace(tool)
             else:
                 reg.register_tool(tool)

@@ -3,9 +3,11 @@ import sys
 from collections.abc import AsyncIterable
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from mcp import StdioServerParameters, stdio_client
 from strands.tools.mcp.mcp_client import MCPClient
 from strands.types.streaming import StreamEvent
@@ -18,6 +20,7 @@ from temporalio.strands_agents import (
     TemporalMCPClient,
     _temporal_mcp_client,
 )
+from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
 from tests.mock_model import MockModel
@@ -450,3 +453,75 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
         workflows=[MCPTwoServersWorkflow],
         plugins=[plugin],
     ).replay_workflow(await handle.fetch_history())
+
+
+def _mcp_tool(server: str, name: str, agent_name: str | None = None) -> TemporalMCPTool:
+    info = _temporal_mcp_client._MCPToolInfo(
+        name=name, description="", input_schema={}, agent_name=agent_name
+    )
+    return TemporalMCPTool(server, info, {})
+
+
+async def _run_hook(hook: Any, event: Any) -> None:
+    """Run a BeforeModelCallEvent hook that TemporalAgent registered."""
+    await hook(event)
+
+
+def _listing(provider: TemporalMCPClient, tools: list[TemporalMCPTool]) -> Any:
+    """Stand in for one {server}-list-tools result, as _refresh() stores it."""
+
+    async def refresh() -> None:
+        provider._tools = list(tools)
+        provider._fetched = True
+
+    return refresh
+
+
+@pytest.mark.parametrize("cache_tools", [False, True])
+async def test_mcp_duplicate_refused_again_after_caught(
+    monkeypatch: pytest.MonkeyPatch, cache_tools: bool
+):
+    """Catching the duplicate-name error does not let the next turn take the name."""
+    monkeypatch.setattr(workflow, "patched", lambda _id: True)
+    a = TemporalMCPClient("a", cache_tools=cache_tools)
+    c = TemporalMCPClient("c", cache_tools=cache_tools)
+    agent = TemporalAgent(model="m", tools=[a, c])
+    event = SimpleNamespace(agent=agent)
+    hook_a = agent._make_mcp_refresh_hook(a)
+    hook_c = agent._make_mcp_refresh_hook(c)
+    monkeypatch.setattr(a, "_refresh", _listing(a, [_mcp_tool("a", "echo")]))
+    monkeypatch.setattr(c, "_refresh", _listing(c, [_mcp_tool("c", "echo")]))
+
+    for _turn in range(2):
+        await _run_hook(hook_a, event)
+        with pytest.raises(ValueError, match="Tool name 'echo' already exists"):
+            await _run_hook(hook_c, event)
+        assert agent.tool_registry.registry["echo"]._server == "a"  # type: ignore[attr-defined]
+
+
+async def test_mcp_upgrade_keeps_other_servers_tool(monkeypatch: pytest.MonkeyPatch):
+    """A run that let b replace a's `echo` keeps a's `echo` when b gains its prefix."""
+    # A run recorded before the duplicate check: the gate keeps its replacing behavior.
+    monkeypatch.setattr(workflow, "patched", lambda _id: False)
+    a = TemporalMCPClient("a")
+    b = TemporalMCPClient("b")
+    agent = TemporalAgent(model="m", tools=[a, b])
+    event = SimpleNamespace(agent=agent)
+    hook_a = agent._make_mcp_refresh_hook(a)
+    hook_b = agent._make_mcp_refresh_hook(b)
+
+    # Before the upgrade both servers listed `echo`, and b's replaced a's.
+    monkeypatch.setattr(a, "_refresh", _listing(a, [_mcp_tool("a", "echo")]))
+    monkeypatch.setattr(b, "_refresh", _listing(b, [_mcp_tool("b", "echo")]))
+    await _run_hook(hook_a, event)
+    await _run_hook(hook_b, event)
+    assert agent.tool_registry.registry["echo"]._server == "b"  # type: ignore[attr-defined]
+
+    # After the upgrade b's listing carries its prefix.
+    monkeypatch.setattr(b, "_refresh", _listing(b, [_mcp_tool("b", "echo", "b_echo")]))
+    await _run_hook(hook_a, event)
+    await _run_hook(hook_b, event)
+    registry = agent.tool_registry.registry
+    assert sorted(registry) == ["b_echo", "echo"]
+    assert registry["echo"]._server == "a"  # type: ignore[attr-defined]
+    assert registry["b_echo"]._server == "b"  # type: ignore[attr-defined]
