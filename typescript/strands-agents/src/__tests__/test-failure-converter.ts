@@ -1,10 +1,17 @@
 import type { TestFn } from 'ava';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, type RetryPolicy } from '@temporalio/common';
+import type { ActivityInboundCallsInterceptorFactory } from '@temporalio/worker';
 import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, helpers, TestWorkflowEnvironment } from '@temporalio/test-helpers';
 import { StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
-import { failTwice, lastFailureOfRetry } from './workflows/strands';
+import {
+  callGuardedActivity,
+  failFrozen,
+  failTwice,
+  lastFailureOfRetry,
+  lastFailureOfRetryAfterActivity,
+} from './workflows/strands';
 
 // Its own file, so the second workflow bundle this test builds lives in its own test process and
 // does not add to the memory the main suite's concurrent workers use.
@@ -18,29 +25,88 @@ test.after.always(async (t) => {
   await t.context.env?.teardown();
 });
 
+// A worker's own activity guard, through the deprecated `activityInbound` field: it denies
+// `guardedActivity`. Counts its calls and the activity body's.
+function activityGuard(): {
+  calls: { guard: number; body: number };
+  activityInbound: ActivityInboundCallsInterceptorFactory[];
+  guardedActivity(): Promise<string>;
+} {
+  const calls = { guard: 0, body: 0 };
+  return {
+    calls,
+    activityInbound: [
+      (ctx) => ({
+        async execute(input, next) {
+          calls.guard++;
+          if (ctx.info.activityType === 'guardedActivity') throw ApplicationFailure.nonRetryable('DENIED');
+          return await next(input);
+        },
+      }),
+    ],
+    async guardedActivity() {
+      calls.body++;
+      return 'EXECUTED';
+    },
+  };
+}
+
+test("the plugin keeps a worker's activityInbound interceptors", async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const guard = activityGuard();
+  const worker = await createWorker({
+    workflowsPath: require.resolve('./workflows/strands'),
+    interceptors: { activityInbound: guard.activityInbound },
+    plugins: [new StrandsPlugin()],
+    activities: { guardedActivity: guard.guardedActivity },
+  });
+  const result = await worker.runUntil(executeWorkflow(callGuardedActivity));
+  t.deepEqual([result, guard.calls], ['DENIED', { guard: 1, body: 0 }]);
+});
+
 test("a worker's own failure converter still applies with the plugin", async (t) => {
-  const { createWorker, startWorkflow } = helpers(t);
+  const { createWorker, startWorkflow, executeWorkflow } = helpers(t);
+  const guard = activityGuard();
 
   // The worker bundles the workflows itself, so the bundle gets its failure converter.
   const worker = await createWorker({
     workflowsPath: require.resolve('./workflows/strands'),
     dataConverter: { failureConverterPath: require.resolve('./encoding-failure-converter') },
+    interceptors: {
+      activityInbound: guard.activityInbound,
+      workflowModules: [require.resolve('./workflows/activity-first-interceptor')],
+    },
     plugins: [new StrandsPlugin()],
     activities: {
       async failingActivity(message: string): Promise<never> {
         throw ApplicationFailure.nonRetryable(`activity failed: ${message}`);
       },
+      guardedActivity: guard.guardedActivity,
     },
   });
-  const [history, lastFailure] = await worker.runUntil(async () => {
+  const [history, frozenHistory, lastFailure, lastFailureAfterActivity, guarded] = await worker.runUntil(async () => {
     const handle = await startWorkflow(failTwice, { args: ['workflow failed'] });
     await t.throwsAsync(handle.result());
-    // The SDK decodes a retried run's last failure before the run starts; it still gets the
-    // caller's converter.
-    const retried = await startWorkflow(lastFailureOfRetry, {
-      retry: { maximumAttempts: 2, initialInterval: '10 milliseconds' },
+    // A frozen failure's `cause` cannot be assigned; Strands' rewrite of it must not fail the
+    // workflow task, which would leave the run open until it times out.
+    const frozen = await startWorkflow(failFrozen, {
+      args: ['frozen failure'],
+      workflowExecutionTimeout: '30 seconds',
     });
-    return [await handle.fetchHistory(), await retried.result()] as const;
+    await t.throwsAsync(frozen.result());
+    // The SDK decodes a retried run's last failure before the run starts; it still gets the
+    // caller's converter, also when the worker's own workflow interceptor decodes an activity
+    // failure before the plugin's interceptor runs.
+    const retry: RetryPolicy = { maximumAttempts: 2, initialInterval: '10 milliseconds' };
+    const retried = await startWorkflow(lastFailureOfRetry, { retry });
+    const retriedAfterActivity = await startWorkflow(lastFailureOfRetryAfterActivity, { retry });
+    return [
+      await handle.fetchHistory(),
+      await frozen.fetchHistory(),
+      await retried.result(),
+      await retriedAfterActivity.result(),
+      await executeWorkflow(callGuardedActivity),
+    ] as const;
   });
 
   // Both failures were stored as the caller's converter writes them, and Strands still marked the
@@ -54,4 +120,16 @@ test("a worker's own failure converter still applies with the plugin", async (t)
     [activityFailure?.message, workflowFailure?.message, cause?.type, cause?.nonRetryable, lastFailure],
     ['Encoded failure', 'Encoded failure', 'StructuredOutputError', true, 'decoded by the caller']
   );
+  // The frozen failure was stored the same way, with its cause rewritten.
+  const frozenFailure = frozenHistory.events?.find((e) => e.workflowExecutionFailedEventAttributes)
+    ?.workflowExecutionFailedEventAttributes?.failure;
+  const frozenCause = frozenFailure?.cause?.applicationFailureInfo;
+  t.deepEqual(
+    [frozenFailure?.message, frozenCause?.type, frozenCause?.nonRetryable],
+    ['Encoded failure', 'StructuredOutputError', true]
+  );
+  t.is(lastFailureAfterActivity, 'decoded by the caller');
+  // The worker's activity guard still runs: it denied the activity, whose body never ran. It also
+  // saw the three failingActivity calls (one in failTwice, one per attempt of the retried run).
+  t.deepEqual([guarded, guard.calls], ['DENIED', { guard: 4, body: 0 }]);
 });

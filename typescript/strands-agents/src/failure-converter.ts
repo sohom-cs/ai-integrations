@@ -89,7 +89,8 @@ let callerConverter: FailureConverter | undefined;
 let decided = false;
 let callerDecodesInWorkflow = false;
 // The SDK decodes the previous run's failure (`workflowInfo().lastFailure`) while it initializes a
-// run, before the decision below can be made.
+// run, before the decision below can be made. That is the run's first decode; a caller's workflow
+// interceptor can decode more failures before the decision, so only the first is kept.
 let earlyDecode:
   | { failure: ProtoFailure; payloadConverter: PayloadConverter; context?: SerializationContext; error: Error }
   | undefined;
@@ -133,7 +134,7 @@ export function composeFailureConverter(caller: FailureConverter): FailureConver
         return caller.failureToError(failure, payloadConverter, context);
       }
       const error = failureConverter.failureToError(failure, payloadConverter, context);
-      if (!decided) earlyDecode = { failure, payloadConverter, context, error };
+      if (!decided && earlyDecode === undefined) earlyDecode = { failure, payloadConverter, context, error };
       return error;
     },
   };
@@ -142,11 +143,14 @@ export function composeFailureConverter(caller: FailureConverter): FailureConver
 /**
  * Rewrite `err` and every error in its `cause` chain, as {@link StrandsFailureConverter} does through
  * its own recursion, which the caller's converter does not call. `err` itself is not changed: an
- * error whose cause was rewritten is replaced with an object that inherits from it.
+ * error whose cause was rewritten is replaced with an object that inherits from it. That object
+ * defines its own `cause`, since assigning one fails when `err`'s is read-only, as in a frozen error.
  */
 function rewriteChain(err: unknown): unknown {
   const rewritten = rewriteError(err);
   if (rewritten !== err || !(err instanceof Error) || err.cause === undefined) return rewritten;
   const cause = rewriteChain(err.cause);
-  return cause === err.cause ? err : Object.assign(Object.create(err) as Error, { cause });
+  return cause === err.cause
+    ? err
+    : Object.defineProperty(Object.create(err) as Error, 'cause', { value: cause, writable: true, configurable: true });
 }

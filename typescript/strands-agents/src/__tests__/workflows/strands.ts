@@ -9,6 +9,7 @@ import {
   type InterruptResponseContentData,
 } from '@strands-agents/sdk';
 import {
+  ActivityFailure,
   ApplicationFailure,
   defineSignal,
   proxyActivities,
@@ -183,12 +184,38 @@ export async function failTwice(message: string): Promise<never> {
   throw ApplicationFailure.create({ message, nonRetryable: true, cause: new StructuredOutputError('no output') });
 }
 
+/** Fails with a frozen failure whose cause is a Strands error, so its `cause` is read-only. */
+export async function failFrozen(message: string): Promise<never> {
+  throw Object.freeze(
+    ApplicationFailure.create({ message, nonRetryable: true, cause: new StructuredOutputError('no output') })
+  );
+}
+
 /** Fails its first attempt with a `Custom` failure; the retry returns how it sees that failure. */
 export async function lastFailureOfRetry(): Promise<string | undefined> {
   if (workflowInfo().attempt === 1) {
     throw ApplicationFailure.create({ message: 'first attempt failed', type: 'Custom' });
   }
   return workflowInfo().lastFailure?.message;
+}
+
+/**
+ * Same as {@link lastFailureOfRetry}; the test's own workflow interceptor awaits a failing activity
+ * before it starts this workflow.
+ */
+export async function lastFailureOfRetryAfterActivity(): Promise<string | undefined> {
+  return await lastFailureOfRetry();
+}
+
+/** Calls `guardedActivity` and returns its result, or the message of the failure that stopped it. */
+export async function callGuardedActivity(): Promise<string> {
+  const { guardedActivity } = proxyActivities<{ guardedActivity(): Promise<string> }>({
+    startToCloseTimeout: '10 seconds',
+    retry: { maximumAttempts: 1 },
+  });
+  return await guardedActivity().catch((err: unknown) =>
+    err instanceof ActivityFailure && err.cause instanceof Error ? err.cause.message : String(err)
+  );
 }
 
 export const approveSignal = defineSignal<[string]>('approve');
