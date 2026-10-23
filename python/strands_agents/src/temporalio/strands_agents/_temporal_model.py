@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncIterable
 from datetime import timedelta
@@ -88,6 +89,7 @@ class TemporalModel(Model):
         }
         self._config: dict[str, Any] = {}
         self._config_loaded = False
+        self._config_load: asyncio.Task[None] | None = None
 
     def update_config(self, **_model_config: Any) -> None:
         """No-op; the real model is configured worker-side via the plugin's factories."""
@@ -107,14 +109,29 @@ class TemporalModel(Model):
         return self._config
 
     async def _load_config(self) -> None:
-        """Read the worker-side model's config once, as an activity."""
+        """Read the worker-side model's config once, as an activity.
+
+        Callers that overlap share one read: a later invocation after the
+        first was cancelled, or reentrant invocations. A caller's cancellation
+        does not cancel the shared read; a failed read is retried by the next
+        invocation.
+        """
         if self._config_loaded:
             return
-        result: _ModelConfig = await workflow.execute_activity_method(
-            ModelActivity.get_model_config,
-            _ModelConfigInput(model_name=self._model_name),
-            **self._options,
-        )
+        if self._config_load is None:
+            self._config_load = asyncio.create_task(self._read_config())
+        await asyncio.shield(self._config_load)
+
+    async def _read_config(self) -> None:
+        try:
+            result: _ModelConfig = await workflow.execute_activity_method(
+                ModelActivity.get_model_config,
+                _ModelConfigInput(model_name=self._model_name),
+                **self._options,
+            )
+        except BaseException:
+            self._config_load = None
+            raise
         if result.model_id is not None:
             self._config["model_id"] = result.model_id
         if result.context_window_limit is not None:
