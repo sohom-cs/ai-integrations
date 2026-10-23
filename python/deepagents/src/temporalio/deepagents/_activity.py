@@ -381,7 +381,7 @@ class DeepAgentActivities:
         config = _serde.rebuild_runnable_config(input.config)
         tool_call = {
             "name": input.tool_name,
-            "args": input.args,
+            "args": _serde.load_tool_args(input.args),
             "id": input.tool_call_id,
             "type": "tool_call",
         }

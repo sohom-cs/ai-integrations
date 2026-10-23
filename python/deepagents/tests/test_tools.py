@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 
@@ -46,10 +46,23 @@ INVOKE_TOOL = "deepagents.invoke_tool"
 # the name against this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
+from langchain_core.messages import HumanMessage  # noqa: E402
+from langchain_core.tools import tool  # noqa: E402
+from langgraph.prebuilt import InjectedState  # noqa: E402
+
 
 def pairing_weather(city: str) -> str:
     """Return the weather for a city."""
     return f"weather:{city}"
+
+
+@tool
+def last_user_message(state: Annotated[dict, InjectedState]) -> str:
+    """Return the last user message from the conversation."""
+    for message in reversed(state["messages"]):
+        if isinstance(message, HumanMessage):
+            return f"user said: {message.content}"
+    return "No user messages found"
 
 
 @activity.defn
@@ -176,6 +189,46 @@ class RepeatedToolCallWorkflow:
             state_snapshot=state_snapshot,
         )
         return str(result["messages"][-1].content)
+
+
+@workflow.defn
+class InjectedStateToolWorkflow:
+    @workflow.run
+    async def run(self, question: str) -> list[str]:
+        state_tool = tool_as_activity(
+            last_user_message, start_to_close_timeout=timedelta(seconds=10)
+        )
+        agent = create_deep_agent(model="fake:model", tools=[state_tool])
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": question}]}
+        )
+        return [str(m.content) for m in result["messages"] if m.type == "tool"]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_tool_reads_messages_from_injected_state(
+    env: WorkflowEnvironment,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    call = {"name": "last_user_message", "args": {}, "id": "state-call"}
+    responses = [AIMessage(content="", tool_calls=[call]), AIMessage(content="done")]
+    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(responses))
+    async with Worker(
+        env.client,
+        task_queue="da-injected-state",
+        workflows=[InjectedStateToolWorkflow],
+        plugins=[plugin],
+    ):
+        out = await env.client.execute_workflow(
+            InjectedStateToolWorkflow.run,
+            "Weather in Paris?",
+            id=f"da-injected-state-{uuid.uuid4()}",
+            task_queue="da-injected-state",
+        )
+
+    # The wrapped tool gets LangChain messages, as it does without Temporal.
+    assert out == ["user said: Weather in Paris?"]
 
 
 @pytest.mark.asyncio

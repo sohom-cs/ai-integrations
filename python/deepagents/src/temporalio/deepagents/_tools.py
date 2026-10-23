@@ -335,7 +335,7 @@ def tool_as_activity(
         activity_input = _activity.ToolActivityInput(
             tool_name=tool_name,
             tool_call_id=tool_call_id,
-            args=kwargs,
+            args=_serde.dump_tool_args(kwargs),
         )
         output = await call_tool(
             activity_input,
