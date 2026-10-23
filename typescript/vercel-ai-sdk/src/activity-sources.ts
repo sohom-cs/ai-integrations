@@ -6,22 +6,28 @@
  */
 
 /**
- * What each plugin Activity depends on. Two Activities with the same name and
- * the same sources do the same thing, so one may replace the other.
+ * What each plugin Activity is: the name it was built under (its operation)
+ * followed by what it depends on. Two Activities with the same operation and
+ * the same dependencies do the same thing, so one may replace the other.
  */
 const activitySources = new WeakMap<object, readonly unknown[]>();
 
-/** Records `sources` for every Activity in `activities` and returns it. */
+/**
+ * Records, for every Activity in `activities`, its own key and `sources`, and
+ * returns `activities`. The key keeps one operation, registered under another
+ * operation's name, from passing as that operation.
+ */
 export function withSources<T extends object>(activities: T, sources: readonly unknown[]): T {
-  for (const fn of Object.values(activities)) activitySources.set(fn, sources);
+  for (const [operation, fn] of Object.entries(activities)) activitySources.set(fn, [operation, ...sources]);
   return activities;
 }
 
 /**
  * Throws if an Activity in `added` would replace a different Activity with the
- * same name in `existing`. The same function, or one built with the same
- * sources, may replace itself: that is the same plugin instance, or one with
- * the same options, registered twice (e.g. on the NativeConnection and the Worker).
+ * same name in `existing`. The same function, or one built for the same
+ * operation from the same sources, may replace itself: that is the same plugin
+ * instance, or one with the same options, registered twice (e.g. on the
+ * NativeConnection and the Worker).
  */
 export function refuseReplacedActivities(plugin: string, existing: object | undefined, added: object): void {
   // What the Worker registers: own enumerable keys with function values.

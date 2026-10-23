@@ -616,7 +616,8 @@ export class GoogleAdkPlugin extends SimplePlugin {
    *
    * @throws TypeError if the Worker already has a different Activity with one
    * of these names: a caller Activity, another integration's Activity, or a
-   * `GoogleAdkPlugin` with a different `modelProvider` or MCP toolset factory.
+   * `GoogleAdkPlugin` with a different `modelProvider` (or the same one in a
+   * different options object) or MCP toolset factory.
    */
   override configureWorker(options: WorkerOptions): WorkerOptions {
     refuseReplacedActivities('GoogleAdkPlugin', options.activities, this.options.activities as object);

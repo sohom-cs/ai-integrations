@@ -90,7 +90,11 @@ export interface ModelActivitiesOptions {
 
 /** @internal */
 export function createModelActivities(options: ModelActivitiesOptions = {}): ModelActivities {
-  const resolveModel = (model: string): BaseLlm => options.modelProvider?.(model) ?? LLMRegistry.newLlm(model);
+  // Read once, so the Activities use the provider recorded with them below.
+  // It is still called as a method of `options`, as before, so a provider
+  // that reads `this` keeps working.
+  const { modelProvider } = options;
+  const resolveModel = (model: string): BaseLlm => modelProvider?.call(options, model) ?? LLMRegistry.newLlm(model);
 
   const activities: ModelActivities = {
     async 'adk-invokeModel'(args: InvokeModelArgs): Promise<LlmResponse[]> {
@@ -145,7 +149,8 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
       }
     },
   };
-  return withSources(activities, [options.modelProvider]);
+  // The provider may read `this`, so its receiver is part of what they depend on.
+  return withSources(activities, modelProvider === undefined ? [] : [modelProvider, options]);
 }
 
 /**

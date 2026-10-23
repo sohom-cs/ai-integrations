@@ -980,12 +980,19 @@ test('configureWorker refuses to replace a different Activity with the same name
   t.throws(() => otherProvider.configureWorker(withMcp), duplicate('invokeModel'));
   const otherFactory = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files: async () => ({}) as any } });
   t.throws(() => otherFactory.configureWorker(withMcp), duplicate('files-listTools'));
+  // Another operation built from the same provider, registered under this name.
+  const aliased = { ...base, activities: { invokeModel: (createActivities(provider) as any).invokeEmbeddingModel } };
+  t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(aliased), duplicate('invokeModel'));
 
-  // The same instance twice (NativeConnection and Worker), or the same options
-  // twice, still registers.
+  // configureWorker accepts the same instance twice (NativeConnection and
+  // Worker), the same options twice, and createActivities with the same
+  // provider. With workflowsPath, Worker.create still rejects a repeated
+  // AiSdkPlugin in the bundler: each one prepends its polyfill entry.
   const plugin = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } });
   t.notThrows(() => plugin.configureWorker(plugin.configureWorker(base)));
   t.notThrows(() => new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(withMcp));
+  const callerSet = { ...base, activities: createActivities(provider) };
+  t.notThrows(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(callerSet));
 });
 
 test('MCP tool schema survives activity serialization', async (t) => {

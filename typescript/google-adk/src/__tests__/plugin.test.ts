@@ -7,11 +7,14 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 
 import test from 'ava';
+import type { LlmResponse } from '@google/adk';
+import { MockActivityEnvironment } from '@temporalio/testing';
 import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
 
-import { GoogleAdkPlugin } from '../index';
+import { GoogleAdkPlugin, type GoogleAdkPluginOptions } from '../index';
 import { interceptors as autoRouteInterceptors } from '../auto-route';
 import { interceptors as polyfillInterceptors } from '../load-polyfills';
+import type { InvokeModelArgs, ModelActivities } from '../model';
 import { fakeModelProvider, mockMCPToolset } from '../testing';
 import { sandboxCompatResolveHook } from './helpers';
 
@@ -242,7 +245,7 @@ test('configureWorker registers model activities, plus the four MCP activities p
   t.is(typeof activities['weather-readResource'], 'function');
 });
 
-test('configureWorker refuses to replace a different Activity with the same name', (t) => {
+test('configureWorker refuses to replace a different Activity with the same name', async (t) => {
   const provider = fakeModelProvider();
   const weather = mockMCPToolset([]);
   const base = { taskQueue: 'tq' } as WorkerOptions;
@@ -257,20 +260,49 @@ test('configureWorker refuses to replace a different Activity with the same name
   t.throws(() => new GoogleAdkPlugin().configureWorker(callerActivities), duplicate('adk-invokeModel'));
   const withProvider = new GoogleAdkPlugin({ modelProvider: provider }).configureWorker(base);
   t.throws(() => new GoogleAdkPlugin().configureWorker(withProvider), duplicate('adk-invokeModel'));
-  const withToolset = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather } }).configureWorker(base);
-  const otherToolset = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather: mockMCPToolset([]) } });
+  const withToolset = new GoogleAdkPlugin({ mcpToolsets: { weather } }).configureWorker(base);
+  const otherToolset = new GoogleAdkPlugin({ mcpToolsets: { weather: mockMCPToolset([]) } });
   t.throws(() => otherToolset.configureWorker(withToolset), duplicate('weather-listTools'));
+  // Another operation built from the same provider, registered under this name.
+  const streaming = (withProvider.activities as Record<string, unknown>)['adk-invokeModelStreaming'];
+  const aliased = { ...base, activities: { 'adk-invokeModel': streaming } };
+  t.throws(() => new GoogleAdkPlugin({ modelProvider: provider }).configureWorker(aliased), duplicate('adk-invokeModel'));
+  // The provider is read once, at construction: changing the options object
+  // afterwards does not change what the first plugin registered.
+  const opts: GoogleAdkPluginOptions = { modelProvider: provider };
+  const first = new GoogleAdkPlugin(opts);
+  opts.modelProvider = fakeModelProvider();
+  t.throws(() => new GoogleAdkPlugin(opts).configureWorker(first.configureWorker(base)), duplicate('adk-invokeModel'));
+  // The provider is still called as a method of its options object, so the
+  // object is part of what the model Activities depend on: one provider method
+  // on two options objects is refused, as is one provider in two objects.
+  function viaDelegate(this: { delegate: GoogleAdkPluginOptions['modelProvider'] }, model: string) {
+    return this.delegate!(model);
+  }
+  const reply = (text: string) => fakeModelProvider([{ content: { role: 'model', parts: [{ text }] } }]);
+  const methodOpts = { delegate: reply('from delegate'), modelProvider: viaDelegate };
+  const otherMethodOpts = { delegate: reply('from another delegate'), modelProvider: viaDelegate };
+  t.throws(
+    () => new GoogleAdkPlugin(otherMethodOpts).configureWorker(new GoogleAdkPlugin(methodOpts).configureWorker(base)),
+    duplicate('adk-invokeModel')
+  );
+  t.throws(() => new GoogleAdkPlugin({ modelProvider: provider }).configureWorker(withProvider), duplicate('adk-invokeModel'));
+  const invokeArgs = { model: 'm', request: { model: 'm', contents: [{ role: 'user', parts: [{ text: 'hi' }] }], config: {} } } as InvokeModelArgs;
+  const methodActivities = new GoogleAdkPlugin(methodOpts).configureWorker(base).activities as ModelActivities;
+  const responses = (await new MockActivityEnvironment().run(methodActivities['adk-invokeModel'], invokeArgs)) as LlmResponse[];
+  t.is(responses[0]?.content?.parts?.[0]?.text, 'from delegate');
 
-  // The same instance twice (NativeConnection and Worker), or the same options
-  // twice, still registers.
+  // configureWorker accepts the same instance twice (NativeConnection and
+  // Worker) and the same options object twice.
   const plugin = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather } });
   t.notThrows(() => plugin.configureWorker(plugin.configureWorker(base)));
   t.notThrows(() => new GoogleAdkPlugin().configureWorker(new GoogleAdkPlugin().configureWorker(base)));
-  t.notThrows(() =>
-    new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { weather } }).configureWorker(withToolset)
-  );
+  t.notThrows(() => new GoogleAdkPlugin({ mcpToolsets: { weather } }).configureWorker(withToolset));
+  const shared: GoogleAdkPluginOptions = { modelProvider: provider, mcpToolsets: { weather } };
+  t.notThrows(() => new GoogleAdkPlugin(shared).configureWorker(new GoogleAdkPlugin(shared).configureWorker(base)));
+  t.notThrows(() => new GoogleAdkPlugin(methodOpts).configureWorker(new GoogleAdkPlugin(methodOpts).configureWorker(base)));
   // Different toolset names from two instances are both kept.
-  const both = new GoogleAdkPlugin({ modelProvider: provider, mcpToolsets: { news: mockMCPToolset([]) } })
+  const both = new GoogleAdkPlugin({ mcpToolsets: { news: mockMCPToolset([]) } })
     .configureWorker(withToolset)
     .activities as Record<string, unknown>;
   t.is(typeof both['weather-callTool'], 'function');
