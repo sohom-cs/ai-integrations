@@ -24,6 +24,17 @@ class _InvokeModelInput:
     system_prompt: str | None = None
     tool_choice: Any = None
     system_prompt_content: Any = None
+    # Sent only for a stateful worker model: the agent's model state, such as
+    # the last response id.
+    model_state: dict[str, Any] | None = None
+
+
+@dataclass
+class _InvokeModelResult:
+    """A stateful model's events and its updated model state."""
+
+    events: list[Any]
+    model_state: dict[str, Any]
 
 
 @dataclass
@@ -47,6 +58,7 @@ class _ModelConfig:
 
     model_id: str | None = None
     context_window_limit: int | None = None
+    stateful: bool = False
 
 
 class ModelActivity:
@@ -100,20 +112,26 @@ class ModelActivity:
         return _ModelConfig(
             model_id=model_id if isinstance(model_id, str) else None,
             context_window_limit=limit if isinstance(limit, int) else None,
+            stateful=bool(model.stateful),
         )
 
     @activity.defn
     @auto_heartbeater
-    async def invoke_model(self, input: _InvokeModelInput) -> list[StreamEvent]:
-        """Run the named model and return its stream events as a list."""
+    async def invoke_model(
+        self, input: _InvokeModelInput
+    ) -> list[StreamEvent] | _InvokeModelResult:
+        """Run the named model and return its stream events as a list.
+
+        When the input carries model state, also return the updated state.
+        """
         model = self._get_model(input.model_name)
-        return [event async for event in _stream(model, input)]
+        return _result([event async for event in _stream(model, input)], input)
 
     @activity.defn
     @auto_heartbeater
     async def invoke_model_streaming(
         self, input: _StreamingInvokeModelInput
-    ) -> list[StreamEvent]:
+    ) -> list[StreamEvent] | _InvokeModelResult:
         """Run the named model and publish each stream event to a WorkflowStream."""
         model = self._get_model(input.model_name)
         events: list[StreamEvent] = []
@@ -125,10 +143,13 @@ class ModelActivity:
             async for event in _stream(model, input):
                 events.append(event)
                 topic.publish(event)
-        return events
+        return _result(events, input)
 
 
 def _stream(model: Model, input: _InvokeModelInput) -> AsyncIterable[StreamEvent]:
+    kwargs: dict[str, Any] = {}
+    if input.model_state is not None:
+        kwargs["model_state"] = input.model_state
     return model.stream(
         input.messages,
         input.tool_specs,
@@ -136,4 +157,14 @@ def _stream(model: Model, input: _InvokeModelInput) -> AsyncIterable[StreamEvent
         tool_choice=input.tool_choice,
         system_prompt_content=input.system_prompt_content,
         invocation_state=input.invocation_state,
+        **kwargs,
     )
+
+
+def _result(
+    events: list[StreamEvent], input: _InvokeModelInput
+) -> list[StreamEvent] | _InvokeModelResult:
+    # Without model state the result stays a plain list, as before.
+    if input.model_state is None:
+        return events
+    return _InvokeModelResult(events=list(events), model_state=input.model_state)

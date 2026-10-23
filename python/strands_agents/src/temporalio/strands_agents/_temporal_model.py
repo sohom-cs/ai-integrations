@@ -15,6 +15,7 @@ from temporalio.workflow import ActivityCancellationType, VersioningIntent
 from ._model_activity import (
     ModelActivity,
     _InvokeModelInput,
+    _InvokeModelResult,
     _ModelConfig,
     _ModelConfigInput,
     _StreamingInvokeModelInput,
@@ -88,6 +89,7 @@ class TemporalModel(Model):
         }
         self._config: dict[str, Any] = {}
         self._config_loaded = False
+        self._stateful = False
 
     def update_config(self, **_model_config: Any) -> None:
         """No-op; the real model is configured worker-side via the plugin's factories."""
@@ -106,6 +108,11 @@ class TemporalModel(Model):
         """The loaded config; Strands' tracing reads ``model_id`` from it."""
         return self._config
 
+    @property
+    def stateful(self) -> bool:
+        """Whether the worker-side model keeps the conversation server-side."""
+        return self._stateful
+
     async def _load_config(self) -> None:
         """Read the worker-side model's config once, as an activity."""
         if self._config_loaded:
@@ -119,6 +126,7 @@ class TemporalModel(Model):
             self._config["model_id"] = result.model_id
         if result.context_window_limit is not None:
             self._config["context_window_limit"] = result.context_window_limit
+        self._stateful = result.stateful
         self._config_loaded = True
 
     def structured_output(self, *_args: Any, **_kwargs: Any) -> Any:
@@ -142,6 +150,10 @@ class TemporalModel(Model):
     ) -> AsyncIterable[StreamEvent]:
         """Run the model via the registered Temporal activity and yield events."""
         clean_state = _filter_serializable(invocation_state) if invocation_state else {}
+        model_state: dict[str, Any] | None = kwargs.get("model_state")
+        sent_state = (
+            dict(model_state) if self._stateful and model_state is not None else None
+        )
         if self._streaming_topic is not None:
             events = await workflow.execute_activity_method(
                 ModelActivity.invoke_model_streaming,
@@ -155,6 +167,7 @@ class TemporalModel(Model):
                     system_prompt_content=system_prompt_content,
                     streaming_topic=self._streaming_topic,
                     streaming_batch_interval_seconds=self._streaming_batch_interval.total_seconds(),
+                    model_state=sent_state,
                 ),
                 **self._options,
             )
@@ -169,8 +182,14 @@ class TemporalModel(Model):
                     system_prompt=system_prompt,
                     tool_choice=tool_choice,
                     system_prompt_content=system_prompt_content,
+                    model_state=sent_state,
                 ),
                 **self._options,
             )
+        if isinstance(events, _InvokeModelResult):
+            if model_state is not None:
+                model_state.clear()
+                model_state.update(events.model_state)
+            events = events.events
         for event in events:
             yield event

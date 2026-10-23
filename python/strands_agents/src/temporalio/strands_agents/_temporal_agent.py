@@ -3,6 +3,7 @@ from datetime import timedelta
 from typing import Any
 
 from strands import Agent
+from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent, HookCallback
 
 from temporalio import workflow
@@ -69,6 +70,9 @@ class TemporalAgent(Agent):
                 "TemporalAgent(...) or pass retry_strategy=None."
             )
         agent_kwargs["retry_strategy"] = None
+        self._manager_given = agent_kwargs.get(
+            "conversation_manager"
+        ) is not None or agent_kwargs.get("context_manager") not in (None, False)
 
         temporal_model = TemporalModel(
             model_name=model,
@@ -144,8 +148,21 @@ class TemporalAgent(Agent):
         """
         if workflow.patched(_MODEL_CONFIG_PATCH):
             await self._temporal_model._load_config()
+            if self._temporal_model.stateful:
+                self._use_server_side_state()
         async for event in super().stream_async(prompt, **kwargs):
             yield event
+
+    def _use_server_side_state(self) -> None:
+        # What Strands' Agent does at construction for a stateful model, which
+        # TemporalAgent can only learn once the worker model's config is read.
+        if self._manager_given:
+            raise ValueError(
+                "context_manager and conversation_manager cannot be used with a "
+                "stateful model. The model manages conversation state server-side."
+            )
+        if not isinstance(self.conversation_manager, NullConversationManager):
+            self.conversation_manager = NullConversationManager()
 
     def take_snapshot(self, *_args: Any, **_kwargs: Any) -> Any:
         """Disabled; Temporal's event history is the source of truth."""
