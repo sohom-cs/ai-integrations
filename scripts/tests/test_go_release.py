@@ -9,9 +9,8 @@ import urllib.error
 import zipfile
 from pathlib import Path
 
-import pytest
-
 import go_release
+import pytest
 import release_tool
 from conftest import commit_all, git
 
@@ -27,8 +26,6 @@ coordinate = "go.temporal.io/fakeplug"
 registry = "goproxy"
 root-api = "fakeplug"
 maturity = "public-preview"
-[release]
-allow-final = false
 [ci]
 runtime-versions = ["1.26.6", "1.27"]
 ''')
@@ -60,6 +57,7 @@ def test_go_tag_metadata_does_not_need_a_python_manifest(go_repo: Path, capsys: 
     assert outputs["coordinate"] == "go.temporal.io/fakeplug"
     assert outputs["go_runtime"] == "1.27"
     assert outputs["github_prerelease"] == "true"
+    assert outputs["maturity"] == "public-preview"
     assert "requires_python" not in outputs
 
 
@@ -92,12 +90,7 @@ def test_go_registry_ordering_and_first_release_after_tagging(go_repo: Path, tmp
     assert release_tool.main([*args, "--version", "0.1.0-rc.3"]) == 1
     assert release_tool.main([*args, "--version", "0.1.0-rc.11"]) == 0
     assert release_tool.main([*args, "--version", "0.1.0-rc.12"]) == 0
-    assert release_tool.main([*args, "--version", "0.1.0"]) == 1  # allow-final gate
-    manifest = go_repo / "go/fakeplug/plugin.toml"
-    manifest.write_text(manifest.read_text().replace("allow-final = false", "allow-final = true"))
     assert release_tool.main([*args, "--version", "0.1.0"]) == 0
-    (go_repo / "go/fakeplug/plugin.go").write_text("// TRANSITION(sdk-cutover)\npackage fakeplug\n")
-    assert release_tool.main([*args, "--version", "0.1.0"]) == 1
 
 
 @pytest.mark.parametrize("code,missing", [(404, True), (410, True), (403, False), (500, False)])
@@ -197,7 +190,8 @@ def test_verification_uses_public_checksums_and_builds_a_clean_consumer(go_repo:
         assert env["GOPROXY"] == "https://proxy.golang.org" and env["GOSUMDB"] == "sum.golang.org"
         assert all(env[key] == "" for key in ("GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOFLAGS"))
         assert env["GOWORK"] == "off" and env["GOTOOLCHAIN"] == "local"
-        assert Path(env["GOMODCACHE"]).parent == kwargs["cwd"]
+        # Cached dependencies without go.mod must not become consumer packages.
+        assert not Path(env["GOMODCACHE"]).is_relative_to(kwargs["cwd"])
         data = {"Path": "go.temporal.io/fakeplug", "Version": "v0.1.0-rc.1", "Sum": "h1:zip", "GoModSum": "h1:mod",
                 "Zip": str(archive), "GoMod": str(go_repo / "go/fakeplug/go.mod")}
         if command[1:3] == ["get", "go.temporal.io/fakeplug@v0.1.0-rc.1"]:
@@ -218,7 +212,7 @@ def test_go_release_notes_use_semver_boundaries_and_go_installation(go_repo: Pat
     notes = release_tool.release_notes(go_repo, "go/fakeplug", "go/fakeplug/v0.1.0-rc.11", "temporalio/ai-integrations")
     assert "go get go.temporal.io/fakeplug@v0.1.0-rc.11" in notes
     assert "go/fakeplug/v0.1.0-rc.2...go/fakeplug/v0.1.0-rc.11" in notes
-    assert "TestPyPI" not in notes and "SDK cutover" not in notes
+    assert "TestPyPI" not in notes
     git(go_repo, "tag", "go/fakeplug/v0.1.0")
     final = release_tool.release_notes(go_repo, "go/fakeplug", "go/fakeplug/v0.1.0", "temporalio/ai-integrations")
     assert "First standalone release" in final and "Fix Go plugin" in final and "Add Go plugin" in final

@@ -18,7 +18,7 @@ import sys
 
 # Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`) joined with the reusable workflow's
 # job name; test_nightly_report.py asserts the two stay in step.
-JOB_RE = re.compile(r"^(?P<language>Python|Java|Go) \((?P<plugin>[^)]+)\) / ")
+JOB_RE = re.compile(r"^(?P<language>Python|Java|Go|TypeScript) \((?P<plugin>[^)]+)\) / ")
 LABEL = "nightly"
 FAILED = {"failure", "timed_out"}
 
@@ -50,9 +50,9 @@ def classify(jobs: list[dict]) -> tuple[set[str], set[str]]:
         if not m or not job.get("conclusion"):
             continue
         plugin = m.group("plugin")
-        # Preserve existing Python and Java issue titles; qualify Go to avoid collisions.
-        if m.group("language") == "Go":
-            plugin = f"go/{plugin}"
+        # Preserve Python and Java issue titles; qualify newer languages to avoid collisions.
+        if m.group("language") in {"Go", "TypeScript"}:
+            plugin = f"{m.group('language').lower()}/{plugin}"
         seen.add(plugin)
         if job["conclusion"] in FAILED:
             failing.add(plugin)
