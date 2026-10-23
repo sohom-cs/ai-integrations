@@ -370,10 +370,14 @@ def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
 
 
 def _default_openai_client() -> AsyncOpenAI:
-    """Return the framework's default client or key, as native runs use, with retries off."""
+    """Return the framework's default client as it is, or a client on its default key.
+
+    A client the application set keeps its own settings, retries included, as in native
+    runs. Otherwise the client has retries off, so that Temporal retries model calls.
+    """
     client = _openai_shared.get_default_openai_client()
     if client is not None:
-        return client.with_options(max_retries=0)
+        return client
     return AsyncOpenAI(api_key=_openai_shared.get_default_openai_key(), max_retries=0)
 
 
