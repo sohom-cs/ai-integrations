@@ -17,6 +17,7 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from ._failure_converter import StrandsFailureConverter
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
+from ._sync_calls import refuse_sync_calls_in_workflows
 from ._temporal_mcp_client import (
     _evict_connection,
     build_call_tool_activity,
@@ -82,6 +83,7 @@ class StrandsPlugin(SimplePlugin):
         A sandbox factory may return an async context manager when its adapter
         needs cleanup after the Activity finishes.
         """
+        refuse_sync_calls_in_workflows()
         default_name: str | None = None
         if models is None:
             models = {"bedrock": _default_bedrock_model}
