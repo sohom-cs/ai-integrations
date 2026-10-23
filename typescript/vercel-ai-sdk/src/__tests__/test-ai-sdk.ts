@@ -48,7 +48,7 @@ import {
 } from '@temporalio/interceptors-opentelemetry';
 import { workflowInterceptorModules } from '@temporalio/testing';
 import { bundleWorkflowCode, DefaultLogger, Worker as CoreWorker } from '@temporalio/worker';
-import type { InjectedSinks } from '@temporalio/worker';
+import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
   test as anyTest,
@@ -961,6 +961,32 @@ const createTestMcpClient = async () => {
   // Return real AI SDK MCP client connected to in-memory server
   return createMCPClient({ transport: clientTransport });
 };
+
+test('configureWorker refuses to replace a different Activity with the same name', (t) => {
+  const provider = new TestProvider(helloWorkflowGenerator());
+  const files = async () => ({}) as any;
+  const base = { taskQueue: 'tq' } as WorkerOptions;
+  const duplicate = (name: string) => ({
+    instanceOf: TypeError,
+    message: new RegExp(`^Duplicate registration of Activity '${name}': AiSdkPlugin would replace`),
+  });
+
+  // A caller Activity, another instance's provider, or another instance's MCP
+  // client factory under the same server name is refused.
+  const callerActivities = { ...base, activities: { invokeModel: async () => 'caller' } };
+  t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(callerActivities), duplicate('invokeModel'));
+  const withMcp = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(base);
+  const otherProvider = new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) });
+  t.throws(() => otherProvider.configureWorker(withMcp), duplicate('invokeModel'));
+  const otherFactory = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files: async () => ({}) as any } });
+  t.throws(() => otherFactory.configureWorker(withMcp), duplicate('files-listTools'));
+
+  // The same instance twice (NativeConnection and Worker), or the same options
+  // twice, still registers.
+  const plugin = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } });
+  t.notThrows(() => plugin.configureWorker(plugin.configureWorker(base)));
+  t.notThrows(() => new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(withMcp));
+});
 
 test('MCP tool schema survives activity serialization', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
