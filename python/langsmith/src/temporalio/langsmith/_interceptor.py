@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import random
+import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -17,7 +18,7 @@ import langsmith
 import langsmith.utils
 import nexusrpc.handler
 from langsmith import tracing_context
-from langsmith.run_helpers import get_current_run_tree
+from langsmith.run_helpers import get_current_run_tree, get_tracing_context
 from langsmith.run_trees import RunTree, WriteReplica
 
 import temporalio.activity
@@ -248,12 +249,20 @@ def _uuid_from_random(rng: random.Random) -> uuid.UUID:
 # ---------------------------------------------------------------------------
 
 
+# Version gate: workflows whose history lacks this marker keep the tracing
+# they started with, so their replays run the same code as before.
+_LANGCHAIN_RUNS_PATCH_ID = "temporal-langsmith-langchain-replay"
+
+
 class _LangChainRuns:
     """Stable IDs for the runs LangChain's tracer makes in one workflow.
 
     LangChain gives each run a random ID and a wall-clock start time, so a
-    replay would make the same runs again as new ones.  This maps each run's
-    ID to one from a workflow-seeded generator, and its start time to
+    replay would make the same runs again as new ones.  In workflow code,
+    the IDs LangChain generates come from ``new_id``, a workflow-seeded
+    generator (see ``_install_langchain_run_id_hook``), so callbacks and
+    LangSmith see the same ID.  A run ID the caller chose, such as
+    ``config["run_id"]``, is kept.  Every run's start time becomes
     ``workflow.now()``.  The generator is separate from
     ``_get_workflow_random`` so the plugin's own run IDs do not change.
     """
@@ -261,8 +270,8 @@ class _LangChainRuns:
     def __init__(self) -> None:
         self._rng = random.Random()
         self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
-        # Posts skipped during replay, for runs that are still open.
-        self.pending: dict[uuid.UUID, dict[str, Any]] = {}
+        # Writes held back during replay, for runs that are still open.
+        self.pending: dict[uuid.UUID, list[_HeldWrite]] = {}
 
         def reseed(seed: int) -> None:
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
@@ -270,11 +279,27 @@ class _LangChainRuns:
         reseed(temporalio.workflow.random_seed())
         temporalio.workflow.register_random_seed_callback(reseed)
 
-    def add(self, run_id: Any) -> uuid.UUID:
-        """Give a run a stable ID and start time, once, and return the ID."""
+    def new_id(self, version: int) -> uuid.UUID:
+        """Generate a run ID, a UUID of ``version`` 4 or 7, like LangChain's."""
+        if version == 4:
+            return _uuid_from_random(self._rng)
+        # UUIDv7: 48 bits of Unix milliseconds, then version, variant and
+        # random bits.  Python before 3.14 rejects version=7 in UUID().
+        millis = int(temporalio.workflow.now().timestamp() * 1000)
+        value = (millis & (1 << 48) - 1) << 80 | self._rng.getrandbits(80)
+        value = value & ~(0xF << 76) | 0x7 << 76
+        value = value & ~(0x3 << 62) | 0x2 << 62
+        return uuid.UUID(int=value)
+
+    def add(self, run_id: Any, *, keep_id: bool = False) -> uuid.UUID:
+        """Give a run a stable ID and start time, once, and return the ID.
+
+        With ``keep_id``, the run keeps its own ID.
+        """
         entry = self._ids.get(str(run_id))
         if entry is None:
-            entry = (_uuid_from_random(self._rng), temporalio.workflow.now())
+            stable = uuid.UUID(str(run_id)) if keep_id else _uuid_from_random(self._rng)
+            entry = (stable, temporalio.workflow.now())
             self._ids[str(run_id)] = entry
         return entry[0]
 
@@ -321,8 +346,10 @@ class _LangChainRuns:
 def _get_langchain_runs() -> _LangChainRuns | None:
     """Get the current workflow's ``_LangChainRuns``.
 
-    Returns ``None`` outside a workflow, in read-only (query) contexts, or
-    when workflow APIs are mocked (unit tests).
+    Returns ``None`` outside a workflow, in read-only (query) contexts, for
+    a workflow whose history predates this tracing (see
+    ``_LANGCHAIN_RUNS_PATCH_ID``), or when workflow APIs are mocked (unit
+    tests).
     """
     try:
         if not temporalio.workflow.in_workflow():
@@ -332,11 +359,79 @@ def _get_langchain_runs() -> _LangChainRuns | None:
         inst = temporalio.workflow.instance()
         runs = getattr(inst, "__temporal_langsmith_langchain_runs", None)
         if runs is None:
-            runs = _LangChainRuns()
+            runs = (
+                _LangChainRuns()
+                if temporalio.workflow.patched(_LANGCHAIN_RUNS_PATCH_ID)
+                else False
+            )
             setattr(inst, "__temporal_langsmith_langchain_runs", runs)
-        return runs
+        return runs if isinstance(runs, _LangChainRuns) else None
     except Exception:
         return None
+
+
+_langchain_run_id_hook_installed = False
+
+
+def _stable_run_ids(generate: Callable[..., Any], version: int) -> Callable[..., Any]:
+    """Wrap a LangChain run ID generator to use ``_LangChainRuns.new_id``.
+
+    It calls ``generate`` outside the tracing context this plugin sets for
+    workflow code, such as in a workflow on a worker without the plugin,
+    and for workflows that predate this tracing.
+    """
+
+    def generate_run_id(*args: Any, **kwargs: Any) -> Any:
+        runs = None
+        if not (args or kwargs) and isinstance(
+            get_tracing_context().get("client"), _ReplaySafeClient
+        ):
+            runs = _get_langchain_runs()
+        return generate(*args, **kwargs) if runs is None else runs.new_id(version)
+
+    return generate_run_id
+
+
+class _UuidModule:
+    """The ``uuid`` module, with another ``uuid4``."""
+
+    def __init__(self, uuid4: Callable[..., Any]) -> None:
+        self.uuid4 = uuid4
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(uuid, name)
+
+
+def _install_langchain_run_id_hook() -> None:
+    """Make the run IDs LangChain generates in workflow code stable.
+
+    LangChain's callback manager generates an ID for each run the caller
+    gave none.  In workflow code these come from ``_LangChainRuns.new_id``
+    instead, so the IDs LangChain's callbacks get are the IDs LangSmith
+    stores, and a replay generates them again.  A caller's own ``run_id``
+    is kept.  Safe to call more than once.
+    """
+    global _langchain_run_id_hook_installed  # noqa: PLW0603
+    if _langchain_run_id_hook_installed:
+        return
+    try:
+        import langchain_core.callbacks.manager as manager
+    except ImportError:
+        return
+    # The names the manager calls; neither is in its __all__.
+    if hasattr(manager, "uuid7"):
+        # langchain-core 0.3.83 to 0.3.86, and 1.1.1 on
+        setattr(manager, "uuid7", _stable_run_ids(getattr(manager, "uuid7"), 7))
+    elif getattr(manager, "uuid", None) is uuid:
+        # Earlier releases call uuid.uuid4()
+        setattr(manager, "uuid", _UuidModule(_stable_run_ids(uuid.uuid4, 4)))
+    else:
+        logger.warning(
+            "This langchain-core generates run IDs in a way the LangSmith plugin "
+            "does not know; LangChain runs in workflows may be posted again on "
+            "replay"
+        )
+    _langchain_run_id_hook_installed = True
 
 
 def _run_headers(run_tree: RunTree) -> dict[str, str]:
@@ -348,15 +443,110 @@ def _run_headers(run_tree: RunTree) -> dict[str, str]:
     return ls_headers
 
 
+# ("post" or "patch", the run dict ``Client.create_run`` or ``update_run``
+# built, that method's auth keyword arguments), as in the client's run ops
+# buffer; or, for a client that is not a ``langsmith.Client``, (method name,
+# its keyword arguments, {})
+_HeldWrite = tuple[str, dict[str, Any], dict[str, Any]]
+
+_holding_client_types: dict[type, type] = {}
+
+
+def _holding_client_type(cls: type) -> type:
+    """Get a subclass of a ``langsmith.Client`` class that holds back writes.
+
+    An instance wraps a client and reads its state.  Its ``create_run`` and
+    ``update_run`` are the client's own, so they sample, redact with the
+    client's callbacks and add the runtime environment as the client does,
+    and raise what it raises.  Only the write after those steps, the tracing
+    queue item, HTTP request or entry in the client's buffer for
+    ``process_buffered_run_ops``, is held back, in ``held``.
+    """
+    holding = _holding_client_types.get(cls)
+    if holding is None:
+
+        def __init__(self: Any, client: langsmith.Client) -> None:  # noqa: N807
+            object.__setattr__(self, "_wrapped", client)
+            object.__setattr__(self, "held", [])
+            # A buffer of its own, never flushed, takes the buffered writes.
+            object.__setattr__(self, "_run_ops_buffer", self.held)
+            object.__setattr__(self, "_run_ops_buffer_lock", threading.Lock())
+
+        def __getattr__(self: Any, name: str) -> Any:  # noqa: N807
+            return getattr(self.__dict__["_wrapped"], name)
+
+        def _create_run(self: Any, run: dict[str, Any], **auth: Any) -> None:
+            self.held.append(("post", run, auth))
+
+        def _update_run(self: Any, run: dict[str, Any], **auth: Any) -> None:
+            self.held.append(("patch", run, auth))
+
+        def _should_flush_run_ops_buffer(_self: Any) -> bool:
+            return False
+
+        holding = type(
+            f"_Holding{cls.__name__}",
+            (cls,),
+            {
+                "__init__": __init__,
+                "__getattr__": __getattr__,
+                "_create_run": _create_run,
+                "_update_run": _update_run,
+                "_should_flush_run_ops_buffer": _should_flush_run_ops_buffer,
+            },
+        )
+        _holding_client_types[cls] = holding
+    return holding
+
+
+def _write_held(client: Any, write: _HeldWrite) -> None:
+    """Make a held write as the client would have made it.
+
+    A client with ``process_buffered_run_ops`` gets the write in its buffer,
+    so the callback processes it before it is sent.
+    """
+    op, run, auth = write
+    if op not in ("post", "patch"):
+        getattr(client, op)(**run)
+    elif getattr(client, "_process_buffered_run_ops", None):
+        with client._run_ops_buffer_lock:
+            client._run_ops_buffer.append(write)
+            if client._should_flush_run_ops_buffer():
+                client._flush_run_ops_buffer()
+    elif op == "post":
+        client._create_run(run, **auth)
+    else:
+        client._update_run(run, **auth)
+
+
+def _prepare_write(
+    client: Any, method: str, kwargs: dict[str, Any]
+) -> list[_HeldWrite]:
+    """Run ``client.<method>(**kwargs)`` without writing, and get its writes.
+
+    Errors from the client's steps propagate.  A client that is not a
+    ``langsmith.Client``, such as a mock, has no such steps; its write is
+    held back as the call itself.
+    """
+    if not issubclass(type(client), langsmith.Client):
+        return [(method, kwargs, {})]
+    holding = _holding_client_type(type(client))(client)
+    getattr(holding, method)(**kwargs)
+    return holding.held
+
+
 class _ReplaySafeClient:
     """Wraps the plugin's LangSmith client for use in workflow code.
 
     LangChain's tracer writes its runs through this client, not through
     ``_ReplaySafeRunTree``.  In workflow code, this gives those runs stable
-    IDs (see ``_LangChainRuns``), skips their writes while history replays,
-    and at the first write after a replay posts the replayed runs that are
-    still open and that this client has not posted, as after a worker
-    restart.  Other calls, and writes from other threads such as
+    IDs (see ``_LangChainRuns``) and holds back their writes while history
+    replays.  A replayed callback still runs the client's own steps before
+    its write, synchronously, so errors those steps raise, such as from a
+    redaction callback, reach LangChain's tracer as in the original run.  At
+    the first write after a replay, it makes the held writes of the replayed
+    runs that are still open and that this client has not posted, as after
+    a worker restart.  Other calls, and writes from other threads such as
     ``_ReplaySafeRunTree``'s background I/O, go to the wrapped client as is.
     """
 
@@ -375,12 +565,14 @@ class _ReplaySafeClient:
         runs = _get_langchain_runs()
         if runs is None or args or kwargs.get("id") is None:
             return self._client.create_run(*args, **kwargs)
-        run_id = runs.add(kwargs["id"])
+        run_id = runs.add(kwargs["id"], keep_id=True)
         runs.remap(kwargs, "id")
         ended = kwargs.get("end_time") is not None
         if _is_replaying():
-            if not ended:
-                runs.pending[run_id] = kwargs
+            held = _prepare_write(self._client, "create_run", kwargs)
+            # An empty list: the client's sampling dropped the run.
+            if not ended and held:
+                runs.pending[run_id] = held
             return None
         self._post_pending(runs)
         self._client.create_run(**kwargs)
@@ -396,6 +588,7 @@ class _ReplaySafeClient:
             return self._client.update_run(*args, **kwargs)
         ended = kwargs.get("end_time") is not None
         if _is_replaying():
+            _prepare_write(self._client, "update_run", kwargs)
             if ended:
                 runs.pending.pop(run_id, None)
             return None
@@ -406,11 +599,25 @@ class _ReplaySafeClient:
         return None
 
     def _post_pending(self, runs: _LangChainRuns) -> None:
-        for run_id, kwargs in runs.pending.items():
-            if run_id not in self._open:
-                self._client.create_run(**kwargs)
-                self._open.add(run_id)
+        # The held writes already went through the client's synchronous
+        # steps at their replayed callbacks; only a process_buffered_run_ops
+        # callback, which runs on the client's buffer, processes them here.
+        # No error can reach workflow code from here; log it.
+        pending = list(runs.pending.items())
         runs.pending.clear()
+        for run_id, held in pending:
+            if run_id in self._open:
+                continue
+            self._open.add(run_id)
+            for write in held:
+                try:
+                    _write_held(self._client, write)
+                except Exception:
+                    temporalio.workflow.logger.warning(
+                        "Failed to post LangSmith run %s after replay",
+                        run_id,
+                        exc_info=True,
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +1037,7 @@ class LangSmithInterceptor(
     ) -> type[_LangSmithWorkflowInboundInterceptor]:
         """Return the workflow interceptor class with config bound."""
         _install_aio_to_thread_override()
+        _install_langchain_run_id_hook()
         config = self
 
         class InterceptorWithConfig(_LangSmithWorkflowInboundInterceptor):
