@@ -3,11 +3,12 @@ import '../../load-polyfills';
 import { z } from 'zod';
 import {
   AfterToolCallEvent,
+  StructuredOutputError,
   tool,
   type InterruptResponseContent,
   type InterruptResponseContentData,
 } from '@strands-agents/sdk';
-import { defineSignal, setHandler, condition } from '@temporalio/workflow';
+import { ApplicationFailure, defineSignal, proxyActivities, setHandler, condition } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalAgent, TemporalMCPClient, type TemporalAgentOptions, workflow as strandsWorkflow } from '../..';
 
@@ -160,6 +161,19 @@ export async function structuredOutputAgent(prompt: string): Promise<unknown> {
   });
   const result = await agent.invoke(prompt);
   return result.structuredOutput;
+}
+
+/**
+ * Fails an activity, then fails the workflow with a Strands error as the cause, so a test can check
+ * how both failures are stored.
+ */
+export async function failTwice(message: string): Promise<never> {
+  const { failingActivity } = proxyActivities<{ failingActivity(message: string): Promise<void> }>({
+    startToCloseTimeout: '10 seconds',
+    retry: { maximumAttempts: 1 },
+  });
+  await failingActivity(message).catch(() => undefined);
+  throw ApplicationFailure.create({ message, nonRetryable: true, cause: new StructuredOutputError('no output') });
 }
 
 export const approveSignal = defineSignal<[string]>('approve');

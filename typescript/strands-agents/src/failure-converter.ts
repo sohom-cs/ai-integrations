@@ -7,6 +7,7 @@ import {
   type ProtoFailure,
   type SerializationContext,
 } from '@temporalio/common';
+import { inWorkflowContext, patched } from '@temporalio/workflow';
 
 export const STRANDS_INTERRUPT_TYPE = 'StrandsInterrupt';
 
@@ -75,3 +76,60 @@ export class StrandsFailureConverter extends DefaultFailureConverter implements 
 
 // ts-prune-ignore-next
 export const failureConverter: FailureConverter = new StrandsFailureConverter();
+
+/**
+ * Patch that marks the runs in which workflow code decodes failures with the caller's failure
+ * converter. Runs recorded before it keep Strands' converter for decoding in workflow code, so they
+ * get the same errors on replay.
+ */
+export const CALLER_FAILURE_CONVERTER_PATCH = 'strands-agents.caller-failure-converter';
+
+// Workflow module state, so one copy per workflow run.
+let composed = false;
+let callerDecodesInWorkflow = false;
+
+/**
+ * Decide, when a workflow run starts, whether its workflow code decodes failures with the caller's
+ * failure converter. Called by the plugin's workflow interceptor; does nothing without a caller
+ * converter.
+ */
+export function decideCallerFailureConverter(): void {
+  if (composed) {
+    callerDecodesInWorkflow = patched(CALLER_FAILURE_CONVERTER_PATCH);
+  }
+}
+
+/**
+ * Put Strands' rewrite of interrupt and terminal errors in front of the caller's failure converter,
+ * so both apply. {@link StrandsPlugin} loads this through a generated module when the client or
+ * worker already has a `failureConverterPath`.
+ *
+ * Encoding only changes what history stores, not what workflow code sees, so it always uses the
+ * caller's converter. Decoding in workflow code uses it only in runs that recorded
+ * {@link CALLER_FAILURE_CONVERTER_PATCH}; others keep {@link StrandsFailureConverter}.
+ */
+export function composeFailureConverter(caller: FailureConverter): FailureConverter {
+  composed = true;
+  return {
+    errorToFailure(err, payloadConverter, context) {
+      return caller.errorToFailure(rewriteChain(err), payloadConverter, context);
+    },
+    failureToError(failure, payloadConverter, context) {
+      return !inWorkflowContext() || callerDecodesInWorkflow
+        ? caller.failureToError(failure, payloadConverter, context)
+        : failureConverter.failureToError(failure, payloadConverter, context);
+    },
+  };
+}
+
+/**
+ * Rewrite `err` and every error in its `cause` chain, as {@link StrandsFailureConverter} does through
+ * its own recursion, which the caller's converter does not call. `err` itself is not changed: an
+ * error whose cause was rewritten is replaced with an object that inherits from it.
+ */
+function rewriteChain(err: unknown): unknown {
+  const rewritten = rewriteError(err);
+  if (rewritten !== err || !(err instanceof Error) || err.cause === undefined) return rewritten;
+  const cause = rewriteChain(err.cause);
+  return cause === err.cause ? err : Object.assign(Object.create(err) as Error, { cause });
+}

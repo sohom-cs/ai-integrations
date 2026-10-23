@@ -4,6 +4,7 @@ import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
 import type { BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
+import { failureConverterPathFor } from './failure-converter-path';
 import { ModelActivity } from './model-activity';
 import type { InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
 import {
@@ -103,9 +104,13 @@ export class StrandsPlugin extends SimplePlugin {
       name: 'StrandsPlugin',
       activities,
       runContext,
-      dataConverter: {
-        failureConverterPath: require.resolve('./failure-converter'),
-      },
+      // Keep a failure converter the client or worker already has: Strands' rewrite runs first,
+      // then the caller's converter.
+      dataConverter: (existing) => ({
+        ...existing,
+        failureConverterPath: failureConverterPathFor(existing?.failureConverterPath),
+      }),
+      workerInterceptors: { workflowModules: [require.resolve('./workflow-interceptors')] },
     });
   }
 
@@ -134,6 +139,9 @@ export class StrandsPlugin extends SimplePlugin {
    *   `eventsource-parser/stream`) with a stub module. MCP v2 bundles its
    *   transports into the client entrypoint, so their static EventSource
    *   imports must also be stubbed. Transport I/O only runs worker-side.
+   *
+   * - Replace the plugin's own `failure-converter-path` module, which writes files
+   *   and only runs when a client or worker is configured, with the same stub.
    *
    * - Inline async chunks so the bundle stays a single file — webpack's
    *   default JSONP chunk loader references `self`/`document`, neither of
@@ -181,7 +189,7 @@ export class StrandsPlugin extends SimplePlugin {
 interface WebpackApi {
   NormalModuleReplacementPlugin: new (
     resourceRegExp: RegExp,
-    newResource: (resource: { request: string }) => void
+    newResource: (resource: { request: string; context: string }) => void
   ) => WebpackPlugin;
 }
 
@@ -215,6 +223,9 @@ function emptyModuleRewritesPlugin(): WebpackPlugin {
       const { NormalModuleReplacementPlugin } = compiler.webpack;
       new NormalModuleReplacementPlugin(ignorePattern, (resource) => {
         resource.request = empty;
+      }).apply(compiler);
+      new NormalModuleReplacementPlugin(/^\.\/failure-converter-path$/, (resource) => {
+        if (resource.context === __dirname) resource.request = empty;
       }).apply(compiler);
     },
   };
