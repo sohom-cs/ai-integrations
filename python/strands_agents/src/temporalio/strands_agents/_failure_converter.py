@@ -1,5 +1,7 @@
 """Failure converter for Strands-specific exceptions."""
 
+import functools
+
 from strands.interrupt import InterruptException
 from strands.types.exceptions import (
     ContextWindowOverflowException,
@@ -9,7 +11,11 @@ from strands.types.exceptions import (
 )
 
 import temporalio.api.failure.v1
-from temporalio.converter import DefaultFailureConverter, PayloadConverter
+from temporalio.converter import (
+    DefaultFailureConverter,
+    FailureConverter,
+    PayloadConverter,
+)
 from temporalio.exceptions import ApplicationError
 
 # Activity-side: when a Strands ``InterruptException`` would otherwise be
@@ -33,6 +39,24 @@ _TERMINAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 
+def _to_strands_error(exception: BaseException) -> BaseException:
+    """Return the typed ApplicationError for a Strands exception, else the exception."""
+    if isinstance(exception, InterruptException):
+        return ApplicationError(
+            f"interrupt:{exception.interrupt.name}",
+            exception.interrupt.to_dict(),
+            type=STRANDS_INTERRUPT_TYPE,
+            non_retryable=True,
+        )
+    if isinstance(exception, _TERMINAL_EXCEPTIONS):
+        return ApplicationError(
+            str(exception),
+            type=type(exception).__name__,
+            non_retryable=True,
+        )
+    return exception
+
+
 class StrandsFailureConverter(DefaultFailureConverter):
     """Failure converter that preserves Strands exception payloads and retryability."""
 
@@ -43,27 +67,40 @@ class StrandsFailureConverter(DefaultFailureConverter):
         failure: temporalio.api.failure.v1.Failure,
     ) -> None:
         """Translate Strands exceptions to typed ApplicationErrors."""
-        if isinstance(exception, InterruptException):
-            super().to_failure(
-                ApplicationError(
-                    f"interrupt:{exception.interrupt.name}",
-                    exception.interrupt.to_dict(),
-                    type=STRANDS_INTERRUPT_TYPE,
-                    non_retryable=True,
-                ),
-                payload_converter,
-                failure,
-            )
-            return
-        if isinstance(exception, _TERMINAL_EXCEPTIONS):
-            super().to_failure(
-                ApplicationError(
-                    str(exception),
-                    type=type(exception).__name__,
-                    non_retryable=True,
-                ),
-                payload_converter,
-                failure,
-            )
-            return
-        super().to_failure(exception, payload_converter, failure)
+        super().to_failure(_to_strands_error(exception), payload_converter, failure)
+
+
+@functools.cache
+def with_strands_failures(
+    base: type[FailureConverter],
+) -> type[FailureConverter]:
+    """Return ``base`` with the Strands exception handling added.
+
+    The SDK default becomes ``StrandsFailureConverter``. Any other class, such as
+    ``DefaultFailureConverterWithEncodedAttributes``, is kept and wrapped, so its
+    own encoding still applies.
+    """
+    if base is DefaultFailureConverter:
+        return StrandsFailureConverter
+    if issubclass(base, StrandsFailureConverter) or getattr(
+        base, "_adds_strands_failures", False
+    ):
+        return base
+
+    def to_failure(
+        self: FailureConverter,
+        exception: BaseException,
+        payload_converter: PayloadConverter,
+        failure: temporalio.api.failure.v1.Failure,
+    ) -> None:
+        base.to_failure(self, _to_strands_error(exception), payload_converter, failure)
+
+    return type(
+        f"Strands{base.__name__}",
+        (base,),
+        {
+            "to_failure": to_failure,
+            "_adds_strands_failures": True,
+            "__module__": __name__,
+        },
+    )

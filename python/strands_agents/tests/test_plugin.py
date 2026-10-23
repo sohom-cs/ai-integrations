@@ -5,14 +5,21 @@ from dataclasses import replace
 
 import pytest
 from botocore.config import Config as BotocoreConfig
+from strands.interrupt import Interrupt, InterruptException
 from strands.models import Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
 
 import temporalio.strands_agents._plugin as plugin_module
 from temporalio.api.common.v1 import Payload
+from temporalio.api.failure.v1 import Failure
 from temporalio.client import ClientConfig
 from temporalio.contrib.pydantic import PydanticPayloadConverter
-from temporalio.converter import DataConverter, PayloadCodec
+from temporalio.converter import (
+    DataConverter,
+    DefaultFailureConverterWithEncodedAttributes,
+    PayloadCodec,
+)
+from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin
 from temporalio.strands_agents._failure_converter import StrandsFailureConverter
 from temporalio.strands_agents._model_activity import ModelActivity
@@ -113,3 +120,38 @@ def test_custom_payload_converter_is_preserved() -> None:
         "data_converter"
     ]
     assert configured is supplied
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_caller_failure_converter_is_kept(target: str) -> None:
+    supplied = replace(
+        DataConverter.default,
+        failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+    )
+    plugin = StrandsPlugin(models={})
+    configured: DataConverter | None
+    if target == "client":
+        configured = plugin.configure_client(_client_config(supplied))["data_converter"]
+    else:
+        configured = plugin.configure_replayer(
+            {"data_converter": supplied, "workflow_runner": SandboxedWorkflowRunner()}
+        ).get("data_converter")
+    assert configured is not None
+
+    # The caller's converter still encodes failure messages.
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        ApplicationError("secret"), configured.payload_converter, failure
+    )
+    assert failure.message == "Encoded failure"
+
+    # The Strands handling is added on top of it.
+    interrupt = Failure()
+    configured.failure_converter.to_failure(
+        InterruptException(Interrupt(id="i1", name="approval", reason="ok?")),
+        configured.payload_converter,
+        interrupt,
+    )
+    assert interrupt.application_failure_info.type == "StrandsInterrupt"
+    assert interrupt.application_failure_info.non_retryable
+    assert interrupt.message == "Encoded failure"
