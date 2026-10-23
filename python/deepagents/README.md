@@ -351,6 +351,12 @@ class LongResearchAgent:
 Pass `continue_as_new_after=N` instead to trigger on a fixed history-event
 count.
 
+When a Temporal failure ends the agent run, `run_deep_agent` raises
+`DeepAgentsWorkflowError` with that failure as its cause. A cancellation is
+the exception: it is raised as is, so an uncaught cancellation closes the
+workflow as cancelled. Use `temporalio.exceptions.is_cancelled_exception(err)`
+to tell it apart in an `except` block.
+
 - **Carries forward:** the accumulated messages. Repeated identical calls are
   NOT deduplicated: a call the agent re-issues after the boundary runs its own
   Activity, so a genuinely new identical request is never served a stale prior
