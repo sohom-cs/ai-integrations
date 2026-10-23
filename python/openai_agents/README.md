@@ -806,6 +806,12 @@ Certain tools are not suitable for a distributed computing environment, so these
 | OpenAI         |    Yes    |
 | LiteLLM        |    Yes    |
 
+Model calls run in an Activity on the Worker, so they use the provider set on the Worker with
+`OpenAIAgentsPlugin(model_provider=...)`. To use several providers, set a `MultiProvider` with a
+prefix map there and choose a provider by model name. A Workflow cannot set its own provider:
+`Runner.run` raises `ValueError` when `RunConfig.model_provider` is anything other than the default.
+Runs that started before this check keep using the Worker's provider.
+
 ### Model Response format
 
 | Model Response | Supported            |
