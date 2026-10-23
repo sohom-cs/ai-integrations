@@ -24,6 +24,9 @@ class _MCPToolInfo:
     description: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None = None
+    # Name the agent sees when the client sets ``prefix``; ``name`` stays the
+    # server's name for calls. Results recorded without it use ``name``.
+    agent_name: str | None = None
 
 
 @dataclass
@@ -170,6 +173,7 @@ def _tool_infos(client: MCPClient, tools: Sequence[Tool]) -> list[_MCPToolInfo]:
                 description=tool.description or "",
                 input_schema=tool.inputSchema,
                 output_schema=tool.outputSchema,
+                agent_name=agent_tool.tool_name if client._prefix else None,
             )
         )
     return infos

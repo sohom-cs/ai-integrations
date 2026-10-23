@@ -1,11 +1,14 @@
 import asyncio
 import sys
+from collections.abc import AsyncIterable
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from mcp import StdioServerParameters, stdio_client
 from strands.tools.mcp.mcp_client import MCPClient
+from strands.types.streaming import StreamEvent
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -324,3 +327,126 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
         workflows=[MCPNoCacheWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+def _echo_client_with_prefix(prefix: str) -> MCPClient:
+    return MCPClient(
+        lambda: stdio_client(
+            StdioServerParameters(
+                command=sys.executable,
+                args=[str(Path(__file__).parent / "echo_mcp_server.py")],
+            )
+        ),
+        prefix=prefix,
+    )
+
+
+_seen_tool_names: list[list[str]] = []
+
+
+class ToolNameRecordingModel(MockModel):
+    """MockModel that records the tool names offered on each call."""
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterable[StreamEvent]:
+        tool_specs = args[1] if len(args) > 1 else kwargs.get("tool_specs")
+        _seen_tool_names.append(sorted(spec["name"] for spec in tool_specs or []))
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+
+@workflow.defn
+class MCPTwoServersWorkflow:
+    def __init__(self) -> None:
+        self.agent = TemporalAgent(
+            model="mock",
+            start_to_close_timeout=timedelta(seconds=30),
+            tools=[
+                TemporalMCPClient(
+                    server="echo_a", start_to_close_timeout=timedelta(seconds=30)
+                ),
+                TemporalMCPClient(
+                    server="echo_b", start_to_close_timeout=timedelta(seconds=30)
+                ),
+            ],
+        )
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        try:
+            result = await self.agent.invoke_async(prompt)
+        except ValueError as err:
+            return f"refused: {err}"
+        return str(result)
+
+
+async def test_mcp_prefix_names_the_tool(client: Client):
+    """A prefixed server's tool keeps its prefix and calls its own server."""
+    task_queue = f"test_mcp_prefix_names_the_tool-{uuid4()}"
+    _seen_tool_names.clear()
+    plugin = StrandsPlugin(
+        models={
+            "mock": lambda: ToolNameRecordingModel(
+                [{"name": "b_echo", "input": {"message": "hi"}}, "Done!"]
+            )
+        },
+        mcp_clients={
+            "echo_a": _echo_client_factory,
+            "echo_b": lambda: _echo_client_with_prefix("b"),
+        },
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPTwoServersWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            MCPTwoServersWorkflow.run,
+            "echo hi",
+            id=f"test_mcp_prefix_names_the_tool_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert await handle.result() == "Done!\n"
+
+    assert _seen_tool_names[0] == ["b_echo", "echo"]
+    history = await handle.fetch_history()
+    assert "echo_b-call-tool" in get_activities(history)
+    assert "echo_a-call-tool" not in get_activities(history)
+
+    await Replayer(
+        workflows=[MCPTwoServersWorkflow],
+        plugins=[plugin],
+    ).replay_workflow(history)
+
+
+async def test_mcp_duplicate_tool_names_are_refused(client: Client):
+    """Two servers that list the same tool name on one agent raise, as in Strands."""
+    task_queue = f"test_mcp_duplicate_tool_names_are_refused-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"mock": lambda: MockModel(["Done!"])},
+        mcp_clients={"echo_a": _echo_client_factory, "echo_b": _echo_client_factory},
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPTwoServersWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            MCPTwoServersWorkflow.run,
+            "echo hi",
+            id=f"test_mcp_duplicate_tool_names_are_refused_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert (await handle.result()).startswith(
+            "refused: Tool name 'echo' already exists."
+        )
+
+    await Replayer(
+        workflows=[MCPTwoServersWorkflow],
+        plugins=[plugin],
+    ).replay_workflow(await handle.fetch_history())

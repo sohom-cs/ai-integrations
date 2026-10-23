@@ -621,6 +621,10 @@ Worker(
 
 Each factory returns a fully configured `MCPClient`, so you can pass options like `tool_filters`, `prefix`, `elicitation_callback`, or `tasks_config` to it.
 
+With `prefix`, the agent sees each of that server's tools as `<prefix>_<name>`, as in Strands, and calls still reach the server under its own name. Tool names must be unique on one agent: when two tools have the same name, for example two servers that both list `search`, the agent's first model call raises `ValueError`, as Strands does when it builds the agent. Give one server a `prefix`, or drop the tool with `tool_filters`. Earlier versions let the later server's tool replace the earlier one; runs that did so before you upgrade keep doing so until they finish.
+
+Runs on this version can route a tool call differently from earlier versions, so an earlier version cannot replay them. Use Worker Versioning, or let those runs finish, before you roll Workers back.
+
 By default, `TemporalMCPClient` re-lists the server's tools (via `{name}-list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
 
 ```python

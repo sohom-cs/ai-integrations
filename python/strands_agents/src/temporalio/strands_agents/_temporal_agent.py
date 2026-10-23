@@ -4,12 +4,17 @@ from typing import Any
 from strands import Agent
 from strands.hooks import BeforeModelCallEvent, HookCallback
 
+from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._temporal_mcp_client import TemporalMCPClient
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
+
+# Runs that registered a duplicate MCP tool name before this check existed
+# replaced the earlier tool; they keep doing so on replay.
+_REFUSE_DUPLICATE_TOOL_NAMES = "strands-refuse-duplicate-mcp-tool-names"
 
 _SNAPSHOT_DISABLED = (
     "TemporalAgent disables take_snapshot()/load_snapshot(). Temporal "
@@ -118,10 +123,19 @@ class TemporalAgent(Agent):
         for name in old_names - set(new):
             reg.registry.pop(name, None)
             reg.dynamic_tools.pop(name, None)
-        # replace() swaps an existing tool in place (no hot-reload guard);
-        # register_tool() adds a newly-discovered one.
+        # replace() swaps this provider's own tool in place (no hot-reload
+        # guard); register_tool() adds a newly-discovered one. A name another
+        # tool already holds is refused, as Strands refuses it natively.
         for name, tool in new.items():
             if name in reg.registry:
+                if name not in old_names and workflow.patched(
+                    _REFUSE_DUPLICATE_TOOL_NAMES
+                ):
+                    raise ValueError(
+                        f"Tool name '{name}' already exists. Cannot register tools "
+                        "with exact same name. Set a different prefix on the "
+                        "MCPClient or drop the tool with tool_filters."
+                    )
                 reg.replace(tool)
             else:
                 reg.register_tool(tool)
