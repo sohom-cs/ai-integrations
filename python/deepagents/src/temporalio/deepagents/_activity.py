@@ -87,6 +87,9 @@ class ToolActivityInput:
     tool_call_id: str
     args: dict[str, Any]
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Set by workflow code that encodes ``args`` with ``_serde.dump_tool_args``.
+    # Input from older workflow code lacks it and passes through unchanged.
+    tagged_args: bool = False
 
 
 @dataclasses.dataclass
@@ -381,7 +384,9 @@ class DeepAgentActivities:
         config = _serde.rebuild_runnable_config(input.config)
         tool_call = {
             "name": input.tool_name,
-            "args": _serde.load_tool_args(input.args),
+            "args": (
+                _serde.load_tool_args(input.args) if input.tagged_args else input.args
+            ),
             "id": input.tool_call_id,
             "type": "tool_call",
         }

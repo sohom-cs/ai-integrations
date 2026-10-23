@@ -7,6 +7,7 @@ expected activity.
 
 from __future__ import annotations
 
+import json
 import sys
 import uuid
 from collections.abc import Sequence
@@ -63,6 +64,20 @@ def last_user_message(state: Annotated[dict, InjectedState]) -> str:
         if isinstance(message, HumanMessage):
             return f"user said: {message.content}"
     return "No user messages found"
+
+
+@tool
+def message_summary(state: Annotated[dict, InjectedState]) -> str:
+    """List the conversation's message types and contents."""
+    return ",".join(
+        f"{type(m).__name__}:{getattr(m, 'content', '?')}" for m in state["messages"]
+    )
+
+
+@tool
+def echo_record(record: dict) -> str:
+    """Echo a record's tenant and tag fields."""
+    return f"{record['tenant']}:{record['__deepagents_tool_arg__']}"
 
 
 @activity.defn
@@ -195,13 +210,20 @@ class RepeatedToolCallWorkflow:
 class InjectedStateToolWorkflow:
     @workflow.run
     async def run(self, question: str) -> list[str]:
-        state_tool = tool_as_activity(
-            last_user_message, start_to_close_timeout=timedelta(seconds=10)
-        )
-        agent = create_deep_agent(model="fake:model", tools=[state_tool])
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": question}]}
-        )
+        with workflow.unsafe.imports_passed_through():
+            from langchain_core.messages import ChatMessage, FunctionMessage
+
+        tools = [
+            tool_as_activity(t, start_to_close_timeout=timedelta(seconds=10))
+            for t in (last_user_message, message_summary, echo_record)
+        ]
+        agent = create_deep_agent(model="fake:model", tools=tools)
+        messages = [
+            ChatMessage(role="critic", content="be brief"),
+            FunctionMessage(name="lookup", content="sunny"),
+            HumanMessage(content=question),
+        ]
+        result = await agent.ainvoke({"messages": messages})
         return [str(m.content) for m in result["messages"] if m.type == "tool"]
 
 
@@ -211,8 +233,14 @@ async def test_wrapped_tool_reads_messages_from_injected_state(
 ) -> None:
     from langchain_core.messages import AIMessage
 
-    call = {"name": "last_user_message", "args": {}, "id": "state-call"}
-    responses = [AIMessage(content="", tool_calls=[call]), AIMessage(content="done")]
+    # A user dict that happens to hold the encoding's tag key stays a dict.
+    record = {"tenant": "keep", "__deepagents_tool_arg__": "ordinary value"}
+    calls = [
+        {"name": "last_user_message", "args": {}, "id": "state-call"},
+        {"name": "message_summary", "args": {}, "id": "summary-call"},
+        {"name": "echo_record", "args": {"record": record}, "id": "record-call"},
+    ]
+    responses = [AIMessage(content="", tool_calls=calls), AIMessage(content="done")]
     plugin = DeepAgentsPlugin(model_provider=mock_model_provider(responses))
     async with Worker(
         env.client,
@@ -227,8 +255,52 @@ async def test_wrapped_tool_reads_messages_from_injected_state(
             task_queue="da-injected-state",
         )
 
-    # The wrapped tool gets LangChain messages, as it does without Temporal.
-    assert out == ["user said: Weather in Paris?"]
+    # The wrapped tools get LangChain messages, including the legacy chat and
+    # function messages, as they do without Temporal.
+    assert out == [
+        "user said: Weather in Paris?",
+        "ChatMessage:be brief,FunctionMessage:sunny,HumanMessage:Weather in Paris?,"
+        "AIMessage:",
+        "keep:ordinary value",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tagged", [False, True])
+async def test_invoke_tool_decodes_only_tagged_args(tagged: bool) -> None:
+    from langchain_core import messages as lc_messages
+
+    from temporalio.deepagents import _serde
+    from temporalio.deepagents._activity import DeepAgentActivities, ToolActivityInput
+    from temporalio.deepagents._tools import register_tool
+    from temporalio.testing import ActivityEnvironment
+
+    register_tool(echo_record)
+    # Untagged input, as older workflow code sends it, passes through even
+    # when a dict holds the tag key; tagged input rebuilds that dict as is.
+    args: dict[str, Any] = {
+        "record": {"tenant": "keep", "__deepagents_tool_arg__": "ordinary value"}
+    }
+    if tagged:
+        args = _serde.dump_tool_args(args)
+    input = ToolActivityInput(
+        tool_name="echo_record", tool_call_id="c-1", args=args, tagged_args=tagged
+    )
+    output = await ActivityEnvironment().run(DeepAgentActivities().invoke_tool, input)
+    assert _serde.load_object(output.message).content == "keep:ordinary value"
+
+    if tagged:
+        # Every message class the encoder tags, chunks included, comes back.
+        chunks = [
+            lc_messages.AIMessageChunk(content="a"),
+            lc_messages.ChatMessageChunk(content="c", role="critic"),
+            lc_messages.FunctionMessageChunk(content="f", name="fn"),
+            lc_messages.HumanMessageChunk(content="h"),
+            lc_messages.SystemMessageChunk(content="s"),
+            lc_messages.ToolMessageChunk(content="t", tool_call_id="1"),
+        ]
+        encoded = json.loads(json.dumps(_serde.dump_tool_args(chunks)))
+        assert _serde.load_tool_args(encoded) == chunks
 
 
 @pytest.mark.asyncio

@@ -151,7 +151,47 @@ def load_object(data: Any) -> Any:
     return load(data)
 
 
-_TOOL_ARG_MESSAGE_KEY = "__deepagents_message__"
+_TOOL_ARG_TAG_KEY = "__deepagents_tool_arg__"
+
+
+def _tool_arg_message_classes() -> tuple[type, ...]:
+    """The message classes :func:`dump_tool_args` tags and :func:`load_tool_args` builds.
+
+    An explicit list, not ``allowed_objects="messages"``: that preset leaves out
+    ``ChatMessage``, ``FunctionMessage`` and their chunks, which a tool can still
+    get from injected state. Subclasses outside this list keep today's encoding.
+    """
+    from langchain_core.messages import (
+        AIMessage,
+        AIMessageChunk,
+        ChatMessage,
+        ChatMessageChunk,
+        FunctionMessage,
+        FunctionMessageChunk,
+        HumanMessage,
+        HumanMessageChunk,
+        RemoveMessage,
+        SystemMessage,
+        SystemMessageChunk,
+        ToolMessage,
+        ToolMessageChunk,
+    )
+
+    return (
+        AIMessage,
+        AIMessageChunk,
+        ChatMessage,
+        ChatMessageChunk,
+        FunctionMessage,
+        FunctionMessageChunk,
+        HumanMessage,
+        HumanMessageChunk,
+        RemoveMessage,
+        SystemMessage,
+        SystemMessageChunk,
+        ToolMessage,
+        ToolMessageChunk,
+    )
 
 
 def dump_tool_args(value: Any) -> Any:
@@ -159,35 +199,44 @@ def dump_tool_args(value: Any) -> Any:
 
     A tool can read the conversation from injected state, so its arguments can
     hold LangChain messages. The Pydantic converter would write each one as a
-    plain dict and drop its unset ``type``, so the tool would get dicts. Tag each
-    message with its ``dumpd`` form so :func:`load_tool_args` rebuilds it; other
-    values pass through unchanged.
+    plain dict and drop its unset ``type``, so the tool would get dicts. Each
+    message becomes ``{tag: "message", "value": dumpd(message)}``. A dict that
+    already has the tag key becomes ``{tag: "dict", "value": ...}``, so user data
+    is never read as a message. Other values pass through unchanged.
     """
-    from langchain_core.messages import BaseMessage
-
-    if isinstance(value, BaseMessage):
-        return {_TOOL_ARG_MESSAGE_KEY: dump_object(value)}
+    if type(value) in _tool_arg_message_classes():
+        return {_TOOL_ARG_TAG_KEY: "message", "value": dump_object(value)}
     if isinstance(value, (list, tuple)):
         return [dump_tool_args(v) for v in value]
     if isinstance(value, dict):
-        return {k: dump_tool_args(v) for k, v in value.items()}
+        encoded = {k: dump_tool_args(v) for k, v in value.items()}
+        if _TOOL_ARG_TAG_KEY in value:
+            return {_TOOL_ARG_TAG_KEY: "dict", "value": encoded}
+        return encoded
     return value
 
 
 def load_tool_args(value: Any) -> Any:
-    """Rebuild the messages tagged by :func:`dump_tool_args`.
+    """Rebuild arguments encoded by :func:`dump_tool_args`.
 
-    Arguments sent by older workflow code have no tags and pass through unchanged.
+    Only call this for input the workflow marked as encoded
+    (``ToolActivityInput.tagged_args``); input from older workflow code is not
+    encoded and must pass through unchanged.
     """
     from langchain_core.load import load
 
-    if isinstance(value, dict) and _TOOL_ARG_MESSAGE_KEY in value:
-        return load(value[_TOOL_ARG_MESSAGE_KEY], allowed_objects="messages")
     if isinstance(value, list):
         return [load_tool_args(v) for v in value]
-    if isinstance(value, dict):
+    if not isinstance(value, dict):
+        return value
+    if _TOOL_ARG_TAG_KEY not in value:
         return {k: load_tool_args(v) for k, v in value.items()}
-    return value
+    kind = value[_TOOL_ARG_TAG_KEY]
+    if kind == "message":
+        return load(value["value"], allowed_objects=_tool_arg_message_classes())
+    if kind == "dict":
+        return {k: load_tool_args(v) for k, v in value["value"].items()}
+    raise ValueError(f"Unknown tool argument tag {kind!r}")
 
 
 # ---------------------------------------------------------------------------
