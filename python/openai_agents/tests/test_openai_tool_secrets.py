@@ -4,7 +4,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Collection
-from typing import Any, cast
+from typing import Annotated, Any, Callable, Generic, TypeVar, cast
 
 import pydantic
 import pytest
@@ -26,7 +26,12 @@ from agents import (
 )
 from agents.items import TResponseStreamEvent
 from agents.tool import ApplyPatchTool, ShellTool, ShellToolEnvironment
-from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputItem,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -188,6 +193,152 @@ def test_lenient_caller_model_keeps_its_type():
     assert isinstance(received.responses[0], ModelResponse)
     assert isinstance(received.responses[0].output[0], ResponseOutputMessage)
     assert received.note == "kept"
+
+
+class _ExtraResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    message: ResponseOutputMessage
+
+
+class _NamedResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(validate_by_alias=False, validate_by_name=True)
+    text: str = pydantic.Field(alias="original")
+    original: str
+    message: ResponseOutputMessage
+
+
+_T = TypeVar("_T")
+
+
+class _WrappedResult(pydantic.BaseModel, Generic[_T]):
+    item: _T
+
+
+class _DescribedResult(pydantic.BaseModel):
+    record: Annotated[ModelResponse, pydantic.Field(description="record")]
+
+
+class _MappedResult(pydantic.BaseModel):
+    records: dict[str, ModelResponse]
+
+
+_RootResult = pydantic.RootModel[dict[str, ResponseOutputMessage]]
+
+
+class _UnionResult(pydantic.BaseModel):
+    call: ResponseOutputItem
+
+
+def _message() -> ResponseOutputMessage:
+    return ResponseOutputMessage(
+        id="msg_1",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(type="output_text", text="done", annotations=[])],
+    )
+
+
+def _call() -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        type="function_call", call_id="c1", name="f", arguments="{}"
+    )
+
+
+def _response() -> ModelResponse:
+    return ModelResponse(output=[_message()], usage=Usage(), response_id="r1")
+
+
+def _is_message(value: Any) -> bool:
+    return isinstance(value, ResponseOutputMessage) and isinstance(
+        value.content[0], ResponseOutputText
+    )
+
+
+def _is_response(value: Any) -> bool:
+    return isinstance(value, ModelResponse) and _is_message(value.output[0])
+
+
+@pytest.mark.parametrize(
+    "value,type_,path,check",
+    [
+        (
+            _ExtraResult(message=_message(), sentinel="keep-me"),  # type: ignore[call-arg]
+            _ExtraResult,
+            ["message", "content", 0, "annotations"],
+            lambda got: (
+                _is_message(got.message)
+                and got.model_extra == {"sentinel": "keep-me"}
+                and json.loads(got.model_dump_json())["sentinel"] == "keep-me"
+            ),
+        ),
+        (
+            _NamedResult.model_validate(
+                {"text": "A", "original": "B", "message": _message()}
+            ),
+            _NamedResult,
+            ["message", "content", 0, "annotations"],
+            lambda got: (
+                got.text == "A" and got.original == "B" and _is_message(got.message)
+            ),
+        ),
+        (
+            _WrappedResult[ModelResponse](item=_response()),
+            _WrappedResult[ModelResponse],
+            ["item", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.item),
+        ),
+        (
+            _DescribedResult(record=_response()),
+            _DescribedResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.record),
+        ),
+        (
+            _MappedResult(records={"a": _response()}),
+            _MappedResult,
+            ["records", "a", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.records["a"]),
+        ),
+        (
+            _RootResult({"a": _message()}),
+            _RootResult,
+            ["a", "content", 0, "annotations"],
+            lambda got: _is_message(got.root["a"]),
+        ),
+        (
+            _UnionResult(call=_call()),
+            _UnionResult,
+            ["call", "arguments"],
+            lambda got: isinstance(got.call, ResponseFunctionToolCall),
+        ),
+    ],
+    ids=[
+        "extra",
+        "alias-is-a-field-name",
+        "generic",
+        "annotated",
+        "dict",
+        "root-model",
+        "discriminated-union",
+    ],
+)
+def test_lenient_caller_model_shapes(
+    value: Any, type_: Any, path: list[Any], check: Callable[[Any], bool]
+):
+    converter = OpenAIPayloadConverter()
+    payload = converter.to_payload(value)
+    raw = json.loads(payload.data)
+    node = raw
+    for key in path[:-1]:
+        node = node[key]
+    del node[path[-1]]
+    payload.data = json.dumps(raw).encode()
+
+    received = converter.from_payload(payload, type_)
+
+    assert isinstance(received, type_)
+    assert check(received)
 
 
 def test_build_tool_reports_unreconstructed_dict():

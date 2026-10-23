@@ -31,6 +31,7 @@ from agents.tracing.provider import DefaultTraceProvider
 # one the SDK uses to parse live API responses. It is in a private module but
 # has no public alias.
 from openai._models import construct_type
+from pydantic.fields import FieldInfo
 from typing_extensions import NotRequired, Required, is_typeddict
 
 import temporalio.api.common.v1
@@ -220,6 +221,9 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     origin = typing.get_origin(type_)
     if origin in (Required, NotRequired):
         return _lenient_construct(typing.get_args(type_)[0], value)
+    if origin is typing.Annotated and _plugin_builds(typing.get_args(type_)[0]):
+        # Other Annotated types, such as OpenAI's discriminated unions, keep their metadata.
+        return _lenient_construct(typing.get_args(type_)[0], value)
     if origin in (typing.Union, types.UnionType):  # pyright: ignore[reportDeprecated]
         # Optional fields and the ``str | list[...]`` input field: build the only
         # variant that fits.
@@ -247,6 +251,9 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     if origin is list and isinstance(value, list):
         (item_type,) = typing.get_args(type_)
         return [_lenient_construct(item_type, item) for item in value]
+    if origin is dict and isinstance(value, dict):
+        _, item_type = typing.get_args(type_) or (typing.Any, typing.Any)
+        return {key: _lenient_construct(item_type, item) for key, item in value.items()}
     if (
         isinstance(type_, type)
         and dataclasses.is_dataclass(type_)
@@ -266,20 +273,70 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
         isinstance(type_, type)
         and issubclass(type_, pydantic.BaseModel)
         and not issubclass(type_, openai.BaseModel)
-        and isinstance(value, dict)
     ):
-        hints = typing.get_type_hints(type_, include_extras=True)
-        fields: dict[str, typing.Any] = {}
-        for name, field in type_.model_fields.items():
-            key = (
-                field.alias
-                if field.alias is not None and field.alias in value
-                else name
-            )
-            if key in value:
-                fields[name] = _lenient_construct(hints.get(name, object), value[key])
-        return type_.model_construct(**fields)
+        return _lenient_model(type_, value)
     return construct_type(type_=type_, value=value)
+
+
+def _lenient_model(type_: type[pydantic.BaseModel], value: typing.Any) -> typing.Any:
+    """Rebuild a caller's Pydantic model whose fields failed strict validation.
+
+    Each field value is rebuilt leniently from the field's resolved type and kept under the key it
+    was sent with, so Pydantic itself still applies the model's aliases, extra fields and root
+    type when it validates the result. Rebuilt OpenAI models and Agents SDK dataclasses are
+    instances, which Pydantic accepts without validating them again. A value that still does not
+    validate is returned as before.
+    """
+    fields = type_.model_fields
+    if issubclass(type_, pydantic.RootModel):
+        rebuilt: typing.Any = _lenient_construct(_field_type(fields["root"]), value)
+    elif isinstance(value, dict):
+        config = type_.model_config
+        by_alias = config.get("validate_by_alias", True)
+        by_name = config.get("validate_by_name", config.get("populate_by_name", False))
+        field_for_key: dict[str, typing.Any] = {}
+        for name, field in fields.items():
+            alias = (
+                field.validation_alias
+                if isinstance(field.validation_alias, str)
+                else field.alias
+            )
+            if alias and by_alias:
+                field_for_key.setdefault(alias, _field_type(field))
+            if not alias or by_name:
+                field_for_key.setdefault(name, _field_type(field))
+        rebuilt = {
+            key: _lenient_construct(field_for_key[key], item)
+            if key in field_for_key
+            else item
+            for key, item in value.items()
+        }
+    else:
+        return construct_type(type_=type_, value=value)
+    try:
+        return type_.model_validate(rebuilt)
+    except pydantic.ValidationError:
+        return construct_type(type_=type_, value=value)
+
+
+def _field_type(field: FieldInfo) -> typing.Any:
+    """A field's resolved type with the metadata Pydantic moved off it, such as union discriminators."""
+    if field.metadata:
+        return typing.Annotated[(field.annotation, *field.metadata)]  # pyright: ignore[reportInvalidTypeArguments]
+    return field.annotation
+
+
+def _plugin_builds(type_: typing.Any) -> bool:
+    """Whether the fallback builds ``type_`` itself rather than handing it to ``construct_type``."""
+    if typing.get_origin(type_) in (list, dict) or is_typeddict(type_):
+        return True
+    return isinstance(type_, type) and (
+        dataclasses.is_dataclass(type_)
+        or (
+            issubclass(type_, pydantic.BaseModel)
+            and not issubclass(type_, openai.BaseModel)
+        )
+    )
 
 
 def _may_hold(type_: typing.Any, value: typing.Any) -> bool:
