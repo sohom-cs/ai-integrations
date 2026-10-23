@@ -902,6 +902,16 @@ SQLite storage is not suited to a distributed workflow environment.
 | :--------------- | :-------: |
 | OpenAI platform  |    Yes    |
 
+Since 1.1.0, the plugin opens `temporal:executeWorkflow` and the other `temporal:*` spans only when a
+trace is open, and scheduling an Activity no longer leaves `temporal:startActivity` as the current
+span. Earlier versions, including `temporalio.contrib.openai_agents` in `temporalio` 1.34.0 and
+earlier, dropped the run's spans when a Workflow started without a client trace, and nested later
+spans, such as tool spans, under the model call's `temporal:startActivity` span. So the span and
+trace IDs that Workflow code reads with `get_current_span()` or `get_current_trace()` can differ
+between versions. If your Workflow code puts such an ID into a command, for example an Activity ID,
+runs started on an earlier version fail to replay after the upgrade: let them finish first, or keep
+them on the earlier version with Worker Versioning.
+
 ## OpenTelemetry Integration
 
 ⚠️ **Public Preview** - This functionality is subject to change prior to General Availability.
