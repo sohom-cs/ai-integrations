@@ -51,7 +51,7 @@ step that fails.
 #### Workflow Side
 
 Use the Claude Agent SDK's own `ClaudeSDKClient` or `query` in the Workflow, as you would without
-Temporal, and pass it a Temporal `transport`.
+Temporal, and pass it a Temporal `transport`. Pass the transport the same `options` as the client.
 
 ```python
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
@@ -94,6 +94,10 @@ worker = Worker(
 
 Always pass `ClaudeSDKClient` and `query` a `transport` in a Workflow. Without one, the Claude
 Agent SDK would start Claude Code from Workflow code.
+
+Pass the transport the same `options` you pass the client. As in the Claude Agent SDK, the
+transport builds Claude Code's command line from them, so options you give only the client, such
+as `allowed_tools` or `mcp_servers`, never reach Claude Code.
 
 ### Subprocess Transport
 
@@ -229,8 +233,6 @@ async with ClaudeSDKClient(options=options, transport=transport) as client:
 # On the Worker
 ClaudeAgentSDKPlugin(activities=REMOTE_ACTIVITIES)
 ```
-
-Pass the transport the same `options` as the client.
 
 ### Secrets
 
