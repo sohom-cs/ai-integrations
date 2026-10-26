@@ -18,14 +18,13 @@ from typing import Any
 import claude_agent_sdk as sdk
 import pytest
 
-from samples.worker import TASK_QUEUE, create_worker
-from samples.workflow import AgentWorkflow, ToolApproval
 from temporalio.claude_agent_sdk import (
     ClaudeAgentSDKPlugin,
 )
 from temporalio.claude_agent_sdk._cli_files import CliFiles
 from temporalio.client import Client, WorkflowHandle
 from temporalio.worker import Interceptor, Replayer
+from tests.helpers.example import TASK_QUEUE, AgentWorkflow, ToolApproval, create_worker
 from tests.helpers.workflows import (
     Chat,
     ChatWorkflow,

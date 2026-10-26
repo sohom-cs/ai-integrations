@@ -1,4 +1,4 @@
-"""The example chat: ClaudeSDKClient in a Workflow, with Claude Code in a subprocess on the Worker."""
+"""The example chat the tests drive: ClaudeSDKClient in a Workflow, with Claude Code in a subprocess on the Worker."""
 
 from __future__ import annotations
 
@@ -20,8 +20,12 @@ from claude_agent_sdk import (
 )
 
 from temporalio import activity, workflow
-from temporalio.claude_agent_sdk import TemporalTransport
+from temporalio.claude_agent_sdk import ClaudeAgentSDKPlugin, TemporalTransport
+from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
+from temporalio.worker import Worker
+
+TASK_QUEUE = "claude-agent-sdk"
 
 
 @dataclass
@@ -131,3 +135,13 @@ class AgentWorkflow:
     def end_conversation(self) -> None:
         """Reject further messages. A message already sent is still answered."""
         self.ended = True
+
+
+def create_worker(client: Client) -> Worker:
+    return Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[AgentWorkflow],
+        activities=[roll_dice],
+        plugins=[ClaudeAgentSDKPlugin()],
+    )

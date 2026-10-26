@@ -80,7 +80,7 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-files = ["src", "samples", "tests"]
+files = ["src", "tests"]
 mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
@@ -89,7 +89,7 @@ ignore_missing_imports = true
 
 [tool.pyright]
 extends = "../_shared/pyrightconfig.json"
-include = ["src", "samples", "tests"]
+include = ["src", "tests"]
 
 # Resolve the plugin's own modules from source rather than from site-packages.
 [[tool.pyright.executionEnvironments]]
