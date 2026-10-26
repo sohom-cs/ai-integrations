@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 from collections.abc import Awaitable, Callable
@@ -13,9 +14,10 @@ from typing import Any
 import pytest
 
 from temporalio import activity
-from temporalio.claude_agent_sdk._subprocess._activities import WATCH_OUTPUT
+from temporalio.api.enums.v1 import EventType
+from temporalio.claude_agent_sdk._subprocess._activities import CLOSE, WATCH_OUTPUT
 from temporalio.client import WorkflowFailureError
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, CancelledError
 from temporalio.worker import (
     ActivityInboundInterceptor,
     ExecuteActivityInput,
@@ -30,6 +32,8 @@ from tests.helpers.harness import (
     say,
 )
 from tests.helpers.workflows import (
+    Chat,
+    ChatWorkflow,
     CliRunWorkflow,
     Hook,
     OneShotWorkflow,
@@ -278,6 +282,40 @@ async def test_an_interrupt_while_a_person_decides_ends_the_turn(
         ["Result", "Two."],
     ]
     assert harness.asked == ["write it", "two"]
+
+
+async def test_cancelling_the_workflow_while_a_person_decides_stops_claude_code(
+    harness: Harness,
+) -> None:
+    harness.answers = ANSWERS
+    chat = Chat(["write it"], str(harness.cli_path))
+    async with harness.start(ChatWorkflow, chat) as handle:
+        await until(lambda: harness.asked)
+        while not await handle.query(ChatWorkflow.pending_approvals):
+            await asyncio.sleep(0.05)
+        [pid] = harness.cli_pids()
+
+        await handle.cancel()
+
+        with pytest.raises(WorkflowFailureError) as raised:
+            await handle.result()
+    assert isinstance(raised.value.cause, CancelledError)
+
+    history = await handle.fetch_history()
+    assert (
+        history.events[-1].event_type
+        == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED
+    )
+    closes = [
+        event
+        for event in history.events
+        if event.activity_task_scheduled_event_attributes.activity_type.name == CLOSE
+    ]
+    assert len(closes) == 1
+    assert harness.sessions() == []
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert not notes(harness).exists()
 
 
 def decision(behavior: str, reason: str | None = None) -> dict[str, Any]:
