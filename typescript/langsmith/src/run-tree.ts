@@ -22,7 +22,7 @@ import type { Client } from 'langsmith';
 import { ApplicationFailure, ApplicationFailureCategory } from '@temporalio/common';
 import { getRandomStream, proxySinks, workflowInfo } from '@temporalio/workflow';
 
-import { ADDRESS_BAGGAGE_ITEM, baggageItem, scrubSensitive, type LangSmithTraceContext } from './propagation';
+import { scrubSensitive, type LangSmithTraceContext } from './propagation';
 import { LANGSMITH_SINK_NAME, type EmitterConfig, type LangSmithSinks, type SerializedRun } from './sinks';
 
 /** Named random stream for recorded-path run ids; isolated from the workflow's main RNG. */
@@ -130,8 +130,7 @@ function serializeRun(run: RunTree): SerializedRun {
     extra,
     tags: run.tags,
     project_name: run.project_name,
-    // LangSmith's address type varies across 0.10.x; its baggage form is the LRN.
-    address: run.address ? baggageItem(run.toHeaders().baggage, ADDRESS_BAGGAGE_ITEM) : undefined,
+    address: run.address,
     events: run.events as Record<string, unknown>[] | undefined,
   };
 }
@@ -165,9 +164,21 @@ export function asOutputs(result: unknown): Record<string, unknown> {
   return { result };
 }
 
-/** The trace context to propagate for `run`, or `undefined` when absent. */
+/** True for a run the workflow isolate built with no destination (see {@link ReplaySafeRunTree.noDestination}). */
+function hasNoDestination(run: RunTree): boolean {
+  return (run as { noDestination?: boolean }).noDestination === true;
+}
+
+/**
+ * The trace context to propagate for `run`, or `undefined` when no LangSmith run exists to parent under: no run, a
+ * run with no destination, or a run LangSmith won't trace (`tracingEnabled: false`). LangSmith turns tracing off for
+ * a run built in an env it can't use, such as a client marker.
+ */
 export function runHeaders(run: RunTree | undefined): LangSmithTraceContext | undefined {
-  return run ? (run.toHeaders() as LangSmithTraceContext) : undefined;
+  if (!run || run.tracingEnabled === false || hasNoDestination(run)) {
+    return undefined;
+  }
+  return run.toHeaders() as LangSmithTraceContext;
 }
 
 /** Emit a short-lived marker run, unless LangSmith turned tracing off for it (an env it can't address). */
@@ -180,13 +191,25 @@ export async function emitMarkerRun(marker: RunTree): Promise<void> {
   await marker.patchRun();
 }
 
-/** Reconstruct a propagated parent {@link RunTree} from a trace context; never throws. */
-export function runTreeFromContext(ctx: LangSmithTraceContext | undefined): RunTree | undefined {
+/**
+ * A run's destination: a LangSmith project, or an agent address (LangSmith's `RunTreeConfig.address`, in the
+ * installed version's own form).
+ */
+export type Destination = Pick<RunTreeConfig, 'project_name' | 'address'>;
+
+/**
+ * Reconstruct a propagated parent {@link RunTree} from a trace context; never throws. LangSmith's `RunTree.fromHeaders`
+ * lets the context's destination outrank `fallback`, so `fallback` applies only when the context names none.
+ */
+export function runTreeFromContext(
+  ctx: LangSmithTraceContext | undefined,
+  fallback?: Destination
+): RunTree | undefined {
   if (!ctx) {
     return undefined;
   }
   try {
-    return RunTree.fromHeaders(ctx) ?? undefined;
+    return RunTree.fromHeaders(ctx, fallback) ?? undefined;
   } catch {
     return undefined;
   }
@@ -200,10 +223,7 @@ interface RunTreeParams {
 }
 
 /** A run's destination from `parent`: the plugin's `projectName` if set, else the parent's address or project. */
-export function inheritedDestination(
-  config: EmitterConfig,
-  parent: RunTree | undefined
-): Pick<RunTreeConfig, 'project_name' | 'address'> {
+export function inheritedDestination(config: EmitterConfig, parent: RunTree | undefined): Destination {
   if (config.projectName !== undefined) {
     return { project_name: config.projectName };
   }
@@ -244,15 +264,18 @@ export class ReplaySafeRunTree extends RunTree {
   // LANGSMITH_RUN_TREE_STREAM named stream. Propagated to every child so the whole
   // subtree mints from one factory.
   protected readonly generateNewUuid4?: () => string;
+  /**
+   * True for a run that is never emitted or propagated. With no plugin `projectName` and a Worker env LangSmith can't
+   * address, that's every Temporal-operation run the isolate builds and the placeholder root, plus any child of such
+   * a run that names no project or address of its own. LangSmith still fills in a project for such a run,
+   * `"default"` inside the isolate, which goes unused.
+   */
+  readonly noDestination: boolean;
 
-  constructor(config: RunTreeConfig, generateNewUuid4?: () => string) {
+  constructor(config: RunTreeConfig, generateNewUuid4?: () => string, noDestination = false) {
     super(ReplaySafeRunTree.fill(config, generateNewUuid4));
     this.generateNewUuid4 = generateNewUuid4;
-    if (!config.project_name && !config.address) {
-      // The isolate can't read env, so LangSmith's env fallback is "default"; the Worker resolves it instead.
-      this.project_name = undefined;
-      this.address = undefined;
-    }
+    this.noDestination = noDestination;
   }
 
   private static fill(config: RunTreeConfig, generateNewUuid4?: () => string): RunTreeConfig {
@@ -279,8 +302,12 @@ export class ReplaySafeRunTree extends RunTree {
     };
   }
 
-  /** Produce a replay-safe child so deeply-nested `traceable` runs stay deterministic. */
-  override createChild(config: RunTreeConfig): ReplaySafeRunTree {
+  /**
+   * Produce a replay-safe child so deeply-nested `traceable` runs stay deterministic. With `noDestination`, the child
+   * is flagged as having no destination even under a run that has one.
+   */
+  override createChild(config: RunTreeConfig, noDestination = false): ReplaySafeRunTree {
+    const namesDestination = Boolean(config.project_name || config.address);
     const child = new ReplaySafeRunTree(
       {
         ...config,
@@ -288,25 +315,29 @@ export class ReplaySafeRunTree extends RunTree {
         parent_run: this,
         parent_run_id: this.id,
         trace_id: this.trace_id,
-        ...(config.project_name || config.address ? {} : { project_name: this.project_name, address: this.address }),
+        ...(namesDestination ? {} : { project_name: this.project_name, address: this.address }),
       },
-      this.generateNewUuid4
+      this.generateNewUuid4,
+      noDestination || (this.noDestination && !namesDestination)
     );
     this.child_runs.push(child);
     return child;
   }
 
-  /** Emit a `createRun` via the Sink, unless replaying. */
+  /** Emit a `createRun` via the Sink, unless replaying or the run has no destination. */
   override async postRun(): Promise<void> {
-    if (isReplaying()) {
+    if (isReplaying() || this.noDestination) {
       return;
     }
     sinks()[LANGSMITH_SINK_NAME].createRun(serializeRun(this));
   }
 
-  /** Record outputs/end-time locally then emit an `updateRun` via the Sink, unless replaying. */
+  /**
+   * Record outputs/end-time locally then emit an `updateRun` via the Sink, unless replaying or the run has no
+   * destination.
+   */
   override async patchRun(): Promise<void> {
-    if (isReplaying()) {
+    if (isReplaying() || this.noDestination) {
       return;
     }
     sinks()[LANGSMITH_SINK_NAME].updateRun(serializeRun(this));
@@ -333,15 +364,21 @@ export class ReplaySafeRunTree extends RunTree {
  * @internal
  */
 export class _RootReplaySafeRunTreeFactory extends ReplaySafeRunTree {
-  /** Produce a replay-safe child with no link back to this factory. */
-  override createChild(config: RunTreeConfig): ReplaySafeRunTree {
+  /**
+   * Produce a replay-safe child with no link back to this factory; `noDestination` as for
+   * {@link ReplaySafeRunTree.createChild}.
+   */
+  override createChild(config: RunTreeConfig, noDestination = false): ReplaySafeRunTree {
+    const namesDestination = Boolean(config.project_name || config.address);
     return new ReplaySafeRunTree(
       {
         ...config,
         run_type: config.run_type ?? RUN_TYPE.CHAIN,
-        project_name: config.project_name ?? this.project_name,
+        // One or the other: naming a project and an address together is an error in LangSmith.
+        ...(namesDestination ? {} : { project_name: this.project_name, address: this.address }),
       },
-      this.generateNewUuid4
+      this.generateNewUuid4,
+      noDestination || (this.noDestination && !namesDestination)
     );
   }
 

@@ -5,7 +5,7 @@
  * @module
  */
 
-import { RunTree } from 'langsmith/run_trees';
+import type { RunTree } from 'langsmith/run_trees';
 import { getCurrentRunTree, traceable } from 'langsmith/traceable';
 import {
   condition,
@@ -18,6 +18,7 @@ import {
   proxyActivities,
   proxyLocalActivities,
   setHandler,
+  sleep,
   startChild,
   workflowInfo,
 } from '@temporalio/workflow';
@@ -116,14 +117,29 @@ export async function DestinationWorkflow(endpoint: string): Promise<string> {
 }
 
 /** Runs workflow-body `traceable`s that name their own project and their own address, then one that names neither. */
-export async function OwnDestinationWorkflow(address: string): Promise<string> {
-  const ownAddress = RunTree.fromHeaders({
-    'langsmith-trace': '20240101T000000000000Z00000000-0000-4000-8000-000000000000',
-    baggage: `langsmith-address=${encodeURIComponent(address)}`,
-  })?.address;
+export async function OwnDestinationWorkflow(address: RunTree['address']): Promise<string> {
   const projectResult = await traceable(async () => 'p', { name: 'own_project_call', project_name: 'own-project' })();
-  const addressResult = await traceable(async () => 'a', { name: 'own_address_call', address: ownAddress })();
+  const addressResult = await traceable(async () => 'a', { name: 'own_address_call', address })();
   return projectResult + addressResult + (await workflowInnerCall('d'));
+}
+
+export const destinationSignal = defineSignal('destinationSignal');
+
+/** Waits for `destinationSignal`, whose handler runs a `traceable`. */
+export async function SignalDestinationWorkflow(): Promise<string> {
+  let signalled = false;
+  setHandler(destinationSignal, async () => {
+    await signalInnerCall('s');
+    signalled = true;
+  });
+  await condition(() => signalled);
+  return 'signalled';
+}
+
+/** Schedules an activity and starts a timer in the same activation. */
+export async function ActivityTimerWorkflow(): Promise<string> {
+  const [result] = await Promise.all([comprehensiveActivity('t'), sleep(1)]);
+  return result;
 }
 
 export async function ComprehensiveWorkflow(iteration: number): Promise<string> {

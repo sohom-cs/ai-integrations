@@ -1,9 +1,10 @@
 /**
  * Destination end-to-end. With no plugin project, runs go where LangSmith's env defaults send them unless a client-side
- * or workflow-body `traceable` names its own project or address, and a misconfigured agent env traces nothing. A plugin
- * project outranks a parent's address on runs built outside the workflow isolate. The plugin's client is a real
- * LangSmith `Client` over a capturing `fetch`, so LangSmith's own destination rules run. Some tests load LangSmith's
- * ESM build for the app side, as an ESM app does, beside the plugin's CommonJS build.
+ * or workflow-body `traceable` names its own project or address. A misconfigured agent env traces nothing that starts
+ * without a parent, while user runs below a parent that names a destination still join it. A plugin project outranks a
+ * parent's address on runs built outside the workflow isolate. The plugin's client is a real LangSmith `Client` over a
+ * capturing `fetch`, so LangSmith's own destination rules run. Some tests load LangSmith's ESM build for the app side,
+ * as an ESM app does, beside the plugin's CommonJS build.
  *
  * @module
  */
@@ -15,17 +16,30 @@ import { Client } from 'langsmith';
 import { RunTree } from 'langsmith/run_trees';
 import { traceable } from 'langsmith/traceable';
 
+import type { Payload } from '@temporalio/common';
+import { Worker } from '@temporalio/worker';
+
 import { createClientInterceptor } from '../client-interceptor';
+import { LangSmithPlugin, envDestination } from '../plugin';
+import { readContextHeader } from '../propagation';
 import * as activities from './activities/comprehensive';
 import { useSharedEnv, withTracingWorker } from './helpers';
 import { comprehensiveNexusServiceHandler } from './stubs/nexus';
-import { DestinationWorkflow, OwnDestinationWorkflow } from './workflows/comprehensive';
+import {
+  ActivityTimerWorkflow,
+  DestinationWorkflow,
+  OwnDestinationWorkflow,
+  SignalDestinationWorkflow,
+  destinationSignal,
+} from './workflows/comprehensive';
 
 process.env.LANGSMITH_TRACING = 'true';
 
 const DESTINATION_ENV_VARS = ['LANGSMITH_PROJECT', 'LANGSMITH_AGENT_ID', 'LANGSMITH_AGENT_ENVIRONMENT'];
 
 const AGENT_ENV = { LANGSMITH_AGENT_ID: 'support', LANGSMITH_AGENT_ENVIRONMENT: 'staging' };
+const HALF_AGENT_ENV = { LANGSMITH_AGENT_ID: 'support' };
+const OTHER_AGENT_ENV = { LANGSMITH_AGENT_ID: 'other', LANGSMITH_AGENT_ENVIRONMENT: 'production' };
 const AGENT_ADDRESS = 'lrn:agents/support/environments/staging';
 const OTHER_ADDRESS = 'lrn:agents/other/environments/production';
 
@@ -64,12 +78,10 @@ interface Builds {
   plugin: LangSmithBuild;
 }
 
-/** `AGENT_ADDRESS` in the installed LangSmith's own address form. */
-function installedAddress(build: LangSmithBuild = CJS_BUILD): RunTree['address'] {
-  return build.RunTree.fromHeaders({
-    'langsmith-trace': `20240101T000000000000Z${randomUUID()}`,
-    baggage: `langsmith-address=${encodeURIComponent(AGENT_ADDRESS)}`,
-  })?.address;
+/** Destination options for the client-side `traceable`. */
+interface ClientRunOptions {
+  address?: RunTree['address'];
+  project_name?: string;
 }
 
 interface CreatedRun {
@@ -78,16 +90,14 @@ interface CreatedRun {
   destination?: string;
 }
 
-/** Run `fn` with `env` as the only destination env vars, restoring them afterwards. */
-async function withDestinationEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+/** Set `env` as the only destination env vars, returning a function that restores the previous ones. */
+function setDestinationEnv(env: Record<string, string>): () => void {
   const saved = DESTINATION_ENV_VARS.map((name) => [name, process.env[name]] as const);
   for (const name of DESTINATION_ENV_VARS) {
     delete process.env[name];
   }
   Object.assign(process.env, env);
-  try {
-    return await fn();
-  } finally {
+  return () => {
     for (const [name, value] of saved) {
       if (value === undefined) {
         delete process.env[name];
@@ -95,6 +105,33 @@ async function withDestinationEnv<T>(env: Record<string, string>, fn: () => Prom
         process.env[name] = value;
       }
     }
+  };
+}
+
+/** Run `fn` with `env` as the only destination env vars, restoring them afterwards. */
+async function withDestinationEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const restore = setDestinationEnv(env);
+  try {
+    return await fn();
+  } finally {
+    restore();
+  }
+}
+
+/**
+ * The agent address `env` names (`AGENT_ADDRESS` by default) in `build`'s own address form, as LangSmith's `RunTree`
+ * constructor resolves it for a run that names no destination. The probe run is never posted.
+ */
+function installedAddress(
+  build: LangSmithBuild = CJS_BUILD,
+  env: Record<string, string> = AGENT_ENV
+): RunTree['address'] {
+  const restore = setDestinationEnv(env);
+  try {
+    const client = new build.Client({ apiUrl: 'http://langsmith.test', apiKey: 'test' });
+    return new build.RunTree({ name: 'address-probe', client, tracingEnabled: false }).address;
+  } finally {
+    restore();
   }
 }
 
@@ -135,7 +172,7 @@ async function runWithEnv(
   env: Record<string, string>,
   addTemporalRuns: boolean,
   clientRun: boolean,
-  clientOptions: { address?: RunTree['address'] } = {},
+  clientOptions: ClientRunOptions = {},
   ownDestination = false,
   builds: Builds = { app: CJS_BUILD, plugin: CJS_BUILD },
   projectName?: string
@@ -159,7 +196,7 @@ async function runWithEnv(
             ? client.workflow.execute(OwnDestinationWorkflow, {
                 taskQueue,
                 workflowId: endpoint,
-                args: [OTHER_ADDRESS],
+                args: [installedAddress(CJS_BUILD, OTHER_AGENT_ENV)],
                 workflowExecutionTimeout: '30s',
               })
             : client.workflow.execute(DestinationWorkflow, { taskQueue, workflowId: endpoint, args: [endpoint] });
@@ -199,7 +236,7 @@ async function assertEveryRunGoesTo(
   env: Record<string, string>,
   addTemporalRuns: boolean,
   destination: string,
-  clientOptions: { address?: RunTree['address'] } = {},
+  clientOptions: ClientRunOptions = {},
   builds?: Builds
 ): Promise<void> {
   const { result, runs } = await runWithEnv(env, addTemporalRuns, true, clientOptions, false, builds);
@@ -312,12 +349,221 @@ test.serial(
   }
 );
 
+test.serial(
+  'no client run, LANGSMITH_PROJECT: workflow-body traceables naming their own project or address keep it',
+  async (t) => {
+    const { result, runs } = await runWithEnv({ LANGSMITH_PROJECT: 'env-project' }, false, false, {}, true);
+    t.is(result, 'pawf:d');
+    t.deepEqual(Object.fromEntries(runs.map((run) => [run.name, run.destination])), {
+      own_project_call: 'own-project',
+      own_address_call: OTHER_ADDRESS,
+      workflow_inner_call: 'env-project',
+    });
+  }
+);
+
+test.serial(
+  'no client run, plugin projectName: every run goes to the plugin project (addTemporalRuns=false)',
+  async (t) => {
+    const { result, runs } = await runWithEnv({}, false, false, {}, false, undefined, 'plugin-project');
+    t.is(result, 'wf:d');
+    t.deepEqual(
+      [...new Set(runs.map((run) => run.name))].sort(),
+      USER_RUNS.filter((name) => name !== 'user_pipeline').sort()
+    );
+    t.deepEqual([...new Set(runs.map((run) => run.destination))], ['plugin-project']);
+  }
+);
+
 // No client-side run, so the client interceptor's own `StartWorkflow:` marker is built too.
 test.serial('misconfigured agent env vars: workflows complete and no run is created or updated', async (t) => {
-  const { result, runs, updates } = await runWithEnv({ LANGSMITH_AGENT_ID: 'support' }, true, false);
+  const { result, runs, updates } = await runWithEnv(HALF_AGENT_ENV, true, false);
   t.is(result, 'wf:d');
   t.deepEqual(runs, []);
   t.deepEqual(updates, []);
+});
+
+test.serial(
+  'misconfigured agent env vars: a signal handler traceable with no parent completes and creates no run',
+  async (t) => {
+    await withDestinationEnv(HALF_AGENT_ENV, async () => {
+      const runs: CreatedRun[] = [];
+      const updates: string[] = [];
+      const pluginClient = capturingClient(CJS_BUILD, runs, updates);
+      await withTracingWorker({
+        collector: { asClient: () => pluginClient },
+        options: { addTemporalRuns: true },
+        activities: {},
+        workerOptions: { workflowsPath: WORKFLOWS_PATH },
+        body: async ({ client, taskQueue }) => {
+          const handle = await client.workflow.start(SignalDestinationWorkflow, {
+            taskQueue,
+            workflowId: `signal-destination-${randomUUID()}`,
+          });
+          await handle.signal(destinationSignal);
+          t.is(await handle.result(), 'signalled');
+        },
+      });
+      await pluginClient.awaitPendingTraceBatches();
+      t.deepEqual(runs, []);
+      t.deepEqual(updates, []);
+    });
+  }
+);
+
+/**
+ * Calls, with no ambient run, each client method that builds its own marker run and propagates it as the parent,
+ * returning the headers each passed on.
+ */
+async function markerCallHeaders(
+  interceptor: ReturnType<typeof createClientInterceptor>
+): Promise<Record<string, Record<string, Payload>>> {
+  const sent: Record<string, Record<string, Payload>> = {};
+  const next = (method: string) =>
+    (async (input: { headers?: Record<string, Payload>; workflowStartHeaders?: Record<string, Payload> }) => {
+      sent[method] = (input.headers ?? input.workflowStartHeaders)!;
+    }) as never;
+  await interceptor.signal!({ signalName: 'sig', args: [], headers: {} } as never, next('signal'));
+  await interceptor.signalWithStart!(
+    { workflowType: 'Wf', signalArgs: [], headers: {} } as never,
+    next('signalWithStart')
+  );
+  await interceptor.query!({ queryType: 'q', args: [], headers: {} } as never, next('query'));
+  await interceptor.startUpdate!({ updateName: 'u', args: [], headers: {} } as never, next('startUpdate'));
+  await interceptor.startUpdateWithStart!(
+    { updateName: 'uws', updateArgs: [], workflowStartHeaders: {} } as never,
+    next('startUpdateWithStart')
+  );
+  return sent;
+}
+
+test.serial('misconfigured agent env vars: a client marker LangSmith left untraced is not propagated', async (t) => {
+  await withDestinationEnv(HALF_AGENT_ENV, async () => {
+    const interceptor = createClientInterceptor({ client: capturingClient(CJS_BUILD, [], []), addTemporalRuns: true });
+    const sent = await markerCallHeaders(interceptor);
+    t.deepEqual(Object.keys(sent).sort(), [
+      'query',
+      'signal',
+      'signalWithStart',
+      'startUpdate',
+      'startUpdateWithStart',
+    ]);
+    for (const [method, headers] of Object.entries(sent)) {
+      t.is(readContextHeader(headers), undefined, method);
+    }
+  });
+});
+
+// The Temporal runs a Worker builds outside the workflow isolate, which follow an incoming parent.
+const OUTSIDE_ISOLATE_TEMPORAL_RUNS = [
+  'StartWorkflow:DestinationWorkflow',
+  'RunActivity:comprehensiveActivity',
+  'RunStartNexusOperationHandler:comprehensiveNexusService/greet',
+];
+
+for (const addTemporalRuns of [true, false]) {
+  test.serial(
+    `misconfigured agent env vars under a client run naming a project: runs join it (addTemporalRuns=${addTemporalRuns})`,
+    async (t) => {
+      const { result, runs } = await runWithEnv(HALF_AGENT_ENV, addTemporalRuns, true, {
+        project_name: 'caller-project',
+      });
+      t.is(result, 'wf:d');
+      t.deepEqual(
+        [...new Set(runs.map((run) => run.name))].sort(),
+        [...USER_RUNS, ...(addTemporalRuns ? OUTSIDE_ISOLATE_TEMPORAL_RUNS : [])].sort()
+      );
+      t.is(new Set(runs.map((run) => run.trace_id)).size, 1);
+      t.deepEqual([...new Set(runs.map((run) => run.destination))], ['caller-project']);
+    }
+  );
+}
+
+test.serial(
+  'empty projectName, misconfigured agent env vars: workflows complete and no run is created or updated',
+  async (t) => {
+    const { result, runs, updates } = await runWithEnv(HALF_AGENT_ENV, true, false, {}, false, undefined, '');
+    t.is(result, 'wf:d');
+    t.deepEqual(runs, []);
+    t.deepEqual(updates, []);
+  }
+);
+
+for (const addTemporalRuns of [true, false]) {
+  test.serial(
+    `empty projectName, misconfigured agent env vars under a client run naming a project: runs join it (addTemporalRuns=${addTemporalRuns})`,
+    async (t) => {
+      const { result, runs } = await runWithEnv(
+        HALF_AGENT_ENV,
+        addTemporalRuns,
+        true,
+        { project_name: 'caller-project' },
+        false,
+        undefined,
+        ''
+      );
+      t.is(result, 'wf:d');
+      t.deepEqual(
+        [...new Set(runs.map((run) => run.name))].sort(),
+        [...USER_RUNS, ...(addTemporalRuns ? OUTSIDE_ISOLATE_TEMPORAL_RUNS : [])].sort()
+      );
+      t.is(new Set(runs.map((run) => run.trace_id)).size, 1);
+      t.deepEqual([...new Set(runs.map((run) => run.destination))], ['caller-project']);
+    }
+  );
+}
+
+for (const [recordName, recordEnv, replayName, replayEnv] of [
+  ['valid', AGENT_ENV, 'misconfigured', HALF_AGENT_ENV],
+  ['misconfigured', HALF_AGENT_ENV, 'valid', AGENT_ENV],
+] as const) {
+  test.serial(
+    `replay: a history recorded under ${recordName} agent env vars replays under ${replayName} ones (addTemporalRuns=true)`,
+    async (t) => {
+      const history = await withDestinationEnv(recordEnv, () =>
+        withTracingWorker({
+          collector: { asClient: () => capturingClient(CJS_BUILD, [], []) },
+          options: { addTemporalRuns: true },
+          activities: { comprehensiveActivity: activities.comprehensiveActivity },
+          workerOptions: { workflowsPath: WORKFLOWS_PATH },
+          body: async ({ client, taskQueue }) => {
+            const handle = await client.workflow.start(ActivityTimerWorkflow, {
+              taskQueue,
+              workflowId: `activity-timer-${randomUUID()}`,
+            });
+            await handle.result();
+            return handle.fetchHistory();
+          },
+        })
+      );
+      await withDestinationEnv(replayEnv, async () => {
+        const plugin = new LangSmithPlugin({ addTemporalRuns: true, client: capturingClient(CJS_BUILD, [], []) });
+        await t.notThrowsAsync(Worker.runReplayHistory({ workflowsPath: WORKFLOWS_PATH, plugins: [plugin] }, history));
+      });
+    }
+  );
+}
+
+test.serial('envDestination: resolves the env default the way LangSmith does, without warning', async (t) => {
+  const client = new Client({ apiUrl: 'http://langsmith.test', apiKey: 'test' });
+  const warnings: unknown[] = [];
+  const { warn, error } = console;
+  console.warn = (...args: unknown[]) => warnings.push(args);
+  console.error = (...args: unknown[]) => warnings.push(args);
+  try {
+    t.deepEqual(
+      await withDestinationEnv({ LANGSMITH_PROJECT: 'env-project' }, async () => envDestination(client)),
+      { project_name: 'env-project' }
+    );
+    t.deepEqual(await withDestinationEnv(AGENT_ENV, async () => envDestination(client)), {
+      address: installedAddress(),
+    });
+    t.is(await withDestinationEnv(HALF_AGENT_ENV, async () => envDestination(client)), undefined);
+  } finally {
+    console.warn = warn;
+    console.error = error;
+  }
+  t.deepEqual(warnings, []);
 });
 
 const NEXT = (async () => undefined) as never;
