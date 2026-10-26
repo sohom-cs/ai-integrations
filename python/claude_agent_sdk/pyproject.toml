@@ -45,6 +45,7 @@ dev = [
   "pydocstyle>=6.3,<7",
   "pytest~=9.0",
   "pytest-asyncio>=0.21.2,<0.22",
+  "pytest-cov>=7,<8",
   "pytest-timeout~=2.2",
   "pytest-xdist>=3.6,<4",
   "pytest-pretty>=1.3",
@@ -68,6 +69,7 @@ asyncio_mode = "auto"
 log_level = "DEBUG"
 log_format = "%(asctime)s [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s)"
 testpaths = ["tests"]
+addopts = "--cov=temporalio.claude_agent_sdk --cov-report=term-missing --cov-fail-under=80"
 timeout = 60
 # Time setup and teardown too, so a stuck fixture ends its test; starting the dev
 # server gets more (see conftest.py).
