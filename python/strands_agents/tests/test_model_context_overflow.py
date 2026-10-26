@@ -153,7 +153,11 @@ async def test_overflow_is_recovered_by_conversation_manager(client: Client):
 
     assert model.seen == control_model.seen
     history = await handle.fetch_history()
-    assert get_activities(history) == ["invoke_model", "invoke_model"]
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "invoke_model",
+    ]
     assert [
         event
         for event in history.events
@@ -161,7 +165,10 @@ async def test_overflow_is_recovered_by_conversation_manager(client: Client):
     ]
     # New executions record the patch marker that gates the exception translation, so
     # that histories recorded without it keep the ActivityError behavior on replay.
-    assert _patch_ids(history) == ["strands-agents.context-window-overflow-recovery"]
+    assert _patch_ids(history) == [
+        "strands-model-config",
+        "strands-agents.context-window-overflow-recovery",
+    ]
 
     await Replayer(
         workflows=[OverflowAgentWorkflow],
