@@ -1,4 +1,4 @@
-"""The example chat: ClaudeSDKClient in a Workflow, with Claude Code in a Docker sandbox."""
+"""The example chat: ClaudeSDKClient in a Workflow, with Claude Code in a subprocess on the Worker."""
 
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ class AgentWorkflow:
             model="claude-sonnet-5-5",
             max_turns=10,
         )
-        transport = TemporalTransport(options, sandbox="docker")
+        transport = TemporalTransport(options)
         async with ClaudeSDKClient(options=options, transport=transport) as client:
             self.client = client
             await workflow.wait_condition(

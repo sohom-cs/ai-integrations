@@ -1,1 +1,1 @@
-"""A chat with Claude in a Docker Sandbox, run against the real Anthropic API."""
+"""A chat with Claude, with Claude Code in a subprocess on the Worker, run against the real Anthropic API."""

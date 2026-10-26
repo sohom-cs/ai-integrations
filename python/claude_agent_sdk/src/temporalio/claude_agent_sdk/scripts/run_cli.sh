@@ -1,7 +1,10 @@
-# Run the CLI (the arguments after $2), feeding it the files in the stdin
-# directory $1 in order, 1.jsonl, 2.jsonl, ..., up to an $end_of_input line.
-# Each file appears whole. On exit, write the CLI's status to $exited, which
-# also stops the feeding.
+# Run the CLI, the arguments after $2, feeding its stdin from the files in
+# directory $1 in order: 1.jsonl, 2.jsonl, and so on. Each file appears whole.
+# Feeding stops, which closes the CLI's stdin, at a line equal to $end_of_input
+# (set by CliFiles), or once stop.sh creates the "end" file and every numbered
+# file was fed. When the CLI exits, write its status to $exited, which also
+# stops the feeding. The status is written aside and moved into place, so no
+# reader sees it empty.
 stdin=$1 exited=$2
 shift 2
 n=1
@@ -13,6 +16,7 @@ while [ ! -e "$exited" ]; do
     done < "$stdin/$n.jsonl"
     n=$((n + 1))
   else
+    [ -e "$stdin/end" ] && exit
     sleep 0.05
   fi
-done | { "$@"; echo $? > "$exited"; }
+done | { "$@"; echo $? > "$exited.new" && mv "$exited.new" "$exited"; }

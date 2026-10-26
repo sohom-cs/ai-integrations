@@ -1,28 +1,57 @@
-"""The errors the Activities fail with to tell the Workflow what happened in the sandbox."""
+"""The errors a transport's Activities fail with, and the Claude Agent SDK errors a :class:`TemporalTransport` raises for them."""
 
 from __future__ import annotations
 
-from temporalio.exceptions import ApplicationError
+from claude_agent_sdk import (
+    ClaudeSDKError,
+    CLIConnectionError,
+    CLINotFoundError,
+    ProcessError,
+)
 
-CLAUDE_CODE_EXITED = "ClaudeCodeExited"
-"""The CLI exited with a nonzero status."""
-UNKNOWN_SANDBOX = "UnknownSandbox"
-"""No sandbox has the name the transport asked for."""
+from temporalio.exceptions import ActivityError, ApplicationError
 
 
-def claude_code_exited(status: int | None, stderr: bytes) -> ApplicationError:
-    """The failure that tells the Workflow the CLI exited, with its status and stderr."""
+def process_error(status: int, stderr: bytes) -> ApplicationError:
+    """The error for Claude Code exiting with a nonzero status. As in the Claude Agent SDK, the transport raises ``ProcessError`` for it."""
     return ApplicationError(
-        f"Claude Code exited with status {status}: {stderr.decode(errors='replace')}",
-        type=CLAUDE_CODE_EXITED,
+        f"Command failed with exit code {status}",
+        status,
+        stderr.decode(errors="replace"),
+        type=ProcessError.__name__,
         non_retryable=True,
     )
 
 
-def unknown_sandbox(name: str) -> ApplicationError:
-    """The failure for a sandbox name no factory is registered under."""
+def cli_not_found_error(message: str) -> ApplicationError:
+    """The error for an Activity that finds no Claude Code to run. Raise it to fail the Activity for good.
+
+    As in the Claude Agent SDK, the transport raises ``CLINotFoundError`` for it.
+    """
+    return ApplicationError(message, type=CLINotFoundError.__name__, non_retryable=True)
+
+
+def cli_connection_error(message: str) -> ApplicationError:
+    """The error for an Activity that can't reach or start Claude Code. Raise it to fail the Activity for good.
+
+    As in the Claude Agent SDK, the transport raises ``CLIConnectionError`` for it.
+    """
     return ApplicationError(
-        f"No sandbox named {name!r} is registered on ClaudeAgentSDKPlugin",
-        type=UNKNOWN_SANDBOX,
-        non_retryable=True,
+        message, type=CLIConnectionError.__name__, non_retryable=True
     )
+
+
+def sdk_error(error: ActivityError) -> ClaudeSDKError:
+    """The error for an Activity that failed for good. As in the Claude Agent SDK, it is a ``ClaudeSDKError``."""
+    cause = error.cause
+    if not isinstance(cause, ApplicationError):
+        sdk: ClaudeSDKError = CLIConnectionError(str(cause or error))
+    elif cause.type == ProcessError.__name__:
+        status, stderr = cause.details
+        sdk = ProcessError(cause.message, status, stderr)
+    elif cause.type == CLINotFoundError.__name__:
+        sdk = CLINotFoundError(cause.message)
+    else:
+        sdk = CLIConnectionError(cause.message)
+    sdk.__cause__ = error
+    return sdk

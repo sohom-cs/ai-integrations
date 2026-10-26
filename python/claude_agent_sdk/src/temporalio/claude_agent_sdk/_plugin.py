@@ -1,49 +1,58 @@
-"""Worker plugin that runs the sandbox Activities and lets Workflows use the Claude Agent SDK."""
+"""Worker plugin that lets Workflows use the Claude Agent SDK and runs a transport's Activities."""
 
 from __future__ import annotations
 
 import dataclasses
 import importlib
-from collections.abc import Mapping
+from collections.abc import Callable, Sequence
+from typing import Any
+
+from claude_agent_sdk import ClaudeSDKError
 
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
-from ._activities import SandboxActivities
-from ._sandbox import SandboxFactory
+from ._activity._settings import merge_settings
+from ._subprocess._activities import subprocess_activities
 
 
 class ClaudeAgentSDKPlugin(SimplePlugin):
-    """Run ``ClaudeSDKClient`` with :class:`TemporalTransport` in Workflows.
+    """Run ``ClaudeSDKClient`` and ``query`` in Workflows.
 
-    ``sandboxes`` maps each sandbox name to the :data:`SandboxFactory` that
-    builds it for each Activity.
+    Give them a :class:`TemporalTransport` as ``transport``, and give this
+    plugin the Activities that transport runs.
     """
 
-    def __init__(self, sandboxes: Mapping[str, SandboxFactory]) -> None:
-        """Create the plugin."""
-        sandbox_activities = SandboxActivities(sandboxes)
+    def __init__(
+        self, *, activities: Sequence[Callable[..., Any]] | None = None
+    ) -> None:
+        """Create the plugin.
+
+        Args:
+            activities: The Activities your transports run. The plugin
+                registers them, plus the one every transport uses to merge
+                settings. Defaults to :func:`subprocess_activities`.
+        """
+        if activities is None:
+            activities = subprocess_activities()
 
         def workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             if not runner:
                 raise ValueError("No WorkflowRunner provided to ClaudeAgentSDKPlugin.")
             if isinstance(runner, SandboxedWorkflowRunner):
-                # anyio loads its asyncio backend lazily with import_module,
-                # which bypasses the sandbox's passthrough and fails on the
-                # backend's threading imports. Load it outside the sandbox so
-                # the anyio passthrough below serves the host module.
+                # Import anyio's asyncio backend here, outside the sandbox.
+                # Inside, anyio imports it lazily with import_module, which
+                # skips the passthrough below and fails on its threading imports.
                 importlib.import_module("anyio._backends._asyncio")
                 return dataclasses.replace(
                     runner,
+                    # Pass these through, so the Workflow shares one copy of
+                    # them with the Worker. anyio, the Claude Agent SDK's async
+                    # runtime, uses threads, and sniffio keeps the running
+                    # async library in a thread-local.
                     restrictions=runner.restrictions.with_passthrough_modules(
-                        "claude_agent_sdk",
-                        # The Claude Agent SDK's async runtime; uses threads
-                        # and thread-locals.
-                        "anyio",
-                        # Detects the running async library through a
-                        # thread-local shared by anyio and the Claude Agent SDK.
-                        "sniffio",
+                        "claude_agent_sdk", "anyio", "sniffio"
                     ),
                 )
             return runner
@@ -51,11 +60,9 @@ class ClaudeAgentSDKPlugin(SimplePlugin):
         super().__init__(
             name="ClaudeAgentSDKPlugin",
             workflow_runner=workflow_runner,
-            activities=[
-                sandbox_activities.connect,
-                sandbox_activities.launch,
-                sandbox_activities.write_stdin,
-                sandbox_activities.watch_output,
-                sandbox_activities.close,
-            ],
+            # Fail the Workflow on a Claude Agent SDK error such as ProcessError,
+            # as it would end a program. Otherwise Temporal retries the Workflow
+            # Task forever.
+            workflow_failure_exception_types=[ClaudeSDKError],
+            activities=[*activities, merge_settings],
         )

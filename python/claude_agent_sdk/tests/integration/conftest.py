@@ -1,4 +1,4 @@
-"""Integration tests: the bundled Claude Code in a local sandbox, with a scripted Anthropic API."""
+"""Integration tests: the bundled Claude Code on this host, with a scripted Anthropic API."""
 
 from __future__ import annotations
 
@@ -12,9 +12,10 @@ from tests.helpers.harness import Harness
 
 
 @pytest.fixture
-def harness(env: WorkflowEnvironment, tmp_path: Path) -> Iterator[Harness]:
-    harness = Harness(env.client, tmp_path)
+def harness(
+    env: WorkflowEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Harness]:
+    harness = Harness(env.client, tmp_path, monkeypatch)
     yield harness
-    harness.release.set()
-    harness.sandbox.kill_processes()
+    harness.kill_processes()
     harness.api.shutdown()

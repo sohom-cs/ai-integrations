@@ -1,13 +1,16 @@
-# Start the CLI once, detached, by running $run (run_cli.sh) with the arguments
-# after it. Prints "<pid> <boot ID>".
-# - A retry finds $pid and starts no second CLI.
-# - $pid is written to $new_pid and moved into place, so no reader sees half.
-# - The CLI's output goes to files, so the exec returns without waiting on it.
-stdin=$1 stdout=$2 log=$3 pid=$4 new_pid=$5 exited=$6 run=$7
-shift 7
-if [ ! -e "$pid" ]; then
-  mkdir -p "$stdin" || exit 1
-  sh -c "$run" sh "$stdin" "$exited" "$@" >>"$stdout" 2>"$log" &
-  echo "$! $(boot_id)" > "$new_pid" && mv "$new_pid" "$pid"
+# Start the CLI once, detached, with its files in directory $1: run $2
+# (run_cli.sh) with the arguments after it.
+# - mkdir is atomic, so only one attempt creates the stdin directory and starts
+#   the CLI. A retry, even a concurrent one, starts no second CLI.
+# - The stdout and stderr files exist before this returns, so watching them can
+#   start at once.
+# - The CLI's output goes to files, so this returns without waiting on it.
+# - The caller runs this in a process group of its own, so $$ is that group.
+#   stop.sh signals the group to stop the CLI and everything it started.
+dir=$1 run=$2
+shift 2
+mkdir -p -m 700 "$dir" && : >>"$dir/stdout.jsonl" && : >>"$dir/stderr.log" || exit 1
+if mkdir "$dir/stdin" 2>/dev/null; then
+  sh -c "$run" sh "$dir/stdin" "$dir/exit" "$@" >>"$dir/stdout.jsonl" 2>>"$dir/stderr.log" &
+  write_pid $! $$ "$dir"
 fi
-cat "$pid"

@@ -71,7 +71,7 @@ def pytest_timeout_set_timer(
     def on_timeout() -> None:
         harness = getattr(item, "funcargs", {}).get("harness")
         if isinstance(harness, Harness):
-            harness.sandbox.kill_processes()
+            harness.kill_processes()
         with contextlib.suppress(OSError):  # no pkill on Windows
             subprocess.run(["pkill", "-KILL", "-P", str(os.getpid())], check=False)
         pytest_timeout.timeout_timer(item, settings)

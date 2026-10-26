@@ -2,8 +2,8 @@
 
 > Release stage: [Pre-release](https://docs.temporal.io/develop/python/integrations/claude-agent-sdk).
 
-Run Claude Code agents as Temporal Workflows. Claude Code runs in a sandbox, and if the Worker,
-Claude Code, or the sandbox fails, it picks up the conversation where it left off.
+Run Claude Code agents as Temporal Workflows. As in the Claude Agent SDK, a transport connects
+your code to Claude Code, and Temporal Activities carry its input and output.
 
 ## Install
 
@@ -15,35 +15,34 @@ uv add temporalio-claude-agent-sdk
 
 Temporal provides durable orchestration for Claude agents:
 
-- **Bring your own sandbox.** Run Claude Code in any sandbox service by implementing one
-  `Sandbox` interface, and register as many as you need by name. 
 - **Durable approvals and hooks.** An agent can pause for a person's approval or your own
   checks and pick up where it left off, however long the wait.
-- **Durable tools.** Custom tools you define get Temporal's retries and timeouts, and a crash
-  doesn't lose their work. Claude Code's built-in tools run in the sandbox.
+- **Durable tools.** Custom tools you define run as Workflow code and can execute Activities, with
+  Temporal's retries and timeouts. A crash doesn't lose their work.
 - **Operational visibility with Temporal UI.** See every message, tool call, approval, and
   retry in the UI included with Temporal.
 
 ## What's Included
 
-- **`TemporalTransport`**: Connects your Workflow to Claude Code running in a sandbox. It starts
-  the sandbox and the CLI, and carries messages between them and your Workflow.
-- **`ClaudeAgentSDKPlugin`**: Add it to your Worker with a `SandboxFactory` for each of your
-  [sandboxes](#sandboxes), each under a name. A factory builds a `Sandbox` from a `SandboxContext`.
-- **`Sandbox`** and **`SandboxError`**: What you implement to run Claude Code in any sandbox
-  service.
+- **`ClaudeAgentSDKPlugin`**: Add it to your Worker to use Claude Code from your Workflows, as you
+  would with the Claude Agent SDK: `query()` for one-shot tasks where you know the prompt up front,
+  or `ClaudeSDKClient` for multi-turn conversations with follow-ups and interrupts.
+- **`TemporalTransport`**: The transport to pass `ClaudeSDKClient` and `query`. It launches Claude
+  Code and carries its input and output through the Activities you give it.
+- **`subprocess_activities()`**: The transport's default Activities, which run Claude Code in a
+  subprocess on the Worker. See [Subprocess Transport](#subprocess-transport).
 
 ## How It Works
 
-Claude Code runs whole, as you'd run it yourself, inside a sandbox, so it keeps all its built-in
-tools and works in the sandbox's files. Your Workflow drives it through the Claude Agent SDK's
-usual `ClaudeSDKClient`, and Temporal retries each step that fails.
+Claude Code runs whole, as in the Claude Agent SDK, so it keeps all its built-in tools. Your
+Workflow drives it through the Claude Agent SDK's usual `ClaudeSDKClient`, and Temporal retries each
+step that fails.
 
-- **Activities move the messages.** Your messages go to Claude Code through Activities. A
-  long-running Activity follows everything Claude Code writes and sends it to your Workflow as
-  Signals.
-- **The sandbox stays isolated.** The sandbox runs only Claude Code and never connects to
-  Temporal.
+- **Activities move the messages.** The transport sends your messages to Claude Code through
+  Activities. A long-running Activity follows everything Claude Code writes and sends it to your
+  Workflow as Signals.
+- **The Activities decide where Claude Code runs.** By default, it runs on the Worker.
+  Your own Activities can run it anywhere they can reach.
 
 ## Usage
 
@@ -51,8 +50,8 @@ usual `ClaudeSDKClient`, and Temporal retries each step that fails.
 
 #### Workflow Side
 
-Use the Claude Agent SDK's own `ClaudeSDKClient` in the Workflow, with a `TemporalTransport`.
-Pass the transport your sandbox's registered name and the same `options` as the client.
+Use the Claude Agent SDK's own `ClaudeSDKClient` or `query` in the Workflow, as you would without
+Temporal, and pass it a Temporal `transport`.
 
 ```python
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
@@ -65,7 +64,7 @@ class ReviewWorkflow:
     @workflow.run
     async def run(self) -> str:
         options = ClaudeAgentOptions()
-        transport = TemporalTransport(options, sandbox="my-sandbox")
+        transport = TemporalTransport(options)
         async with ClaudeSDKClient(options=options, transport=transport) as client:
             await client.query("Review utils.py for bugs that would cause crashes.")
             async for message in client.receive_response():
@@ -76,8 +75,7 @@ class ReviewWorkflow:
 
 #### Worker Side
 
-Register a factory that builds [your sandbox](#sandboxes) with `ClaudeAgentSDKPlugin`, under the
-name passed to `TemporalTransport`. Add the plugin and Workflow to the Worker.
+Add `ClaudeAgentSDKPlugin` and the Workflow to the Worker.
 
 ```python
 from temporalio.claude_agent_sdk import ClaudeAgentSDKPlugin
@@ -88,66 +86,165 @@ worker = Worker(
     client,
     task_queue="agents",
     workflows=[ReviewWorkflow],
-    plugins=[ClaudeAgentSDKPlugin({"my-sandbox": lambda context: MySandbox()})],
+    plugins=[ClaudeAgentSDKPlugin()],
 )
 ```
 
-### Secrets
+## Transports
 
-Give secrets to your sandbox on the Worker, so they stay out of Workflow history, or point Claude
-Code at a credential proxy with `ANTHROPIC_BASE_URL`.
+Always pass `ClaudeSDKClient` and `query` a `transport` in a Workflow. Without one, the Claude
+Agent SDK would start Claude Code from Workflow code.
 
-Don't put secrets in `ClaudeAgentOptions.env`: it is recorded in Workflow history.
+### Subprocess Transport
 
-## Sandboxes
+By default, `TemporalTransport` uses `subprocess_activities()`, the Temporal counterpart of the
+Claude Agent SDK's default `SubprocessCLITransport`. They run Claude Code in a subprocess on the
+Worker that runs the launch Activity:
 
-Claude Code runs in a sandbox you choose. Connect any sandbox service by implementing `Sandbox`.
+- Claude Code runs as the Worker's user, with the Worker's environment, and works in the Worker's
+  files. Paths in `ClaudeAgentOptions`, such as `cwd` and `cli_path`, are on the Worker.
+- Claude Code runs apart from the Worker process. If only the Worker process restarts, Claude Code
+  keeps running, and the next Activity picks up its output where the last one stopped. If the
+  container or host restarts, Claude Code stops with it.
+- All of the Activities must run on the host Claude Code runs on. If your Workers run on several
+  hosts, pass the transport a `task_queue` that only one host polls.
 
-> [!WARNING]
-> Any Workflow run can connect to a session, including one another run is still using, such as
-> after a reset. The session's files can then store duplicate work from both runs.
-
-### Your Own Sandbox
-
-Implement five methods, and the transport calls them as it needs:
-
-- **`start`** starts the session's sandbox.
-- **`exec`** and **`stream`** run commands in the sandbox. Raise `SandboxError` when you can't
-  connect to the sandbox.
-- **`write_files`** copies files from the Worker into the sandbox, such as Claude Code's input
-  and the plugins in `options.plugins`. Each file has its content and mode. Copy them however
-  your sandbox service works best, as long as each file appears whole. For example, write it
-  under a temporary name, then rename it.
-- **`terminate`** ends the sandbox.
-
-The sandbox needs `sh`, `cat`, `mkdir`, `mv`, `rm`, `sleep`, `tail`, `wc`, and
-Claude Code.
-
-Register a factory function with `ClaudeAgentSDKPlugin` under a name. The factory takes a
-`SandboxContext` and returns a `Sandbox`. The context holds the sandbox name and the Workflow's
-namespace, ID, run ID, and first run ID, and you decide how to key the sandbox from them. The
-first run ID stays the same through a reset and continue-as-new, so it's a good key for
-resuming. The factory runs on every Activity attempt, so if a sandbox is lost, the retry gets a
-new one. You can also use the context to pick sandbox sizes per Workflow:
+`TemporalTransport` takes options such as `task_queue`, timeouts, and a retry policy:
 
 ```python
-from temporalio.claude_agent_sdk import ClaudeAgentSDKPlugin, Sandbox, SandboxContext
+from temporalio.claude_agent_sdk import TemporalTransport
 
-
-def sandbox_for(context: SandboxContext) -> Sandbox:
-    if context.workflow_id.startswith("big-"):
-        return MySandbox(context.first_execution_run_id, cpus=8)
-    return MySandbox(context.first_execution_run_id)
-
-plugin = ClaudeAgentSDKPlugin({"my-sandbox": sandbox_for})
+transport = TemporalTransport(options, task_queue="claude-host-1")
+async with ClaudeSDKClient(options=options, transport=transport) as client:
+    ...
 ```
+
+### Custom Transport
+
+To run Claude Code somewhere other than the Worker, such as on a remote host or in a container, write four
+Activities and pass them to `TemporalTransport`. The transport runs them; you don't write any
+Workflow code.
+
+| Activity | Gets | Does | Returns |
+|---|---|---|---|
+| `launch` | `LaunchRequest` | Starts Claude Code with `args` and `env`, unless it already started | A handle, such as a host or container ID |
+| `write_stdin` | `StdinWrite` | Writes `text` to Claude Code's stdin as write `number` | |
+| `watch_output` | `WatchRequest` | Calls `watch_output`, which sends Claude Code's output to the Workflow until it exits | |
+| `stop` | `StopRequest` | Stops Claude Code and everything it started | |
+
+Each request has the transport's `session_id`, and every request after `launch` has the `handle`
+it returned. Activities can be retried, so make each safe to run more than once.
+
+#### Example
+
+`CliFiles` and `follow_lines` make this easier. `CliFiles` gives the `sh` commands that start, feed, and stop Claude Code,
+with its output in files. You run the commands with your host's exec, and read the files with
+its file API. `subprocess_activities()` uses the same commands on the Worker.
+
+```python
+from collections.abc import AsyncIterator, Callable
+
+from temporalio import activity
+from temporalio.claude_agent_sdk import (
+    CliFiles,
+    LaunchRequest,
+    StdinWrite,
+    StopRequest,
+    WatchRequest,
+    follow_lines,
+    watch_output,
+)
+
+
+@activity.defn
+async def launch_remote(request: LaunchRequest) -> str:
+    host = await hosts.get_or_create(request.session_id)
+    files = CliFiles("/tmp", request.session_id)
+    await host.exec(files.launch_command("claude", request.args), env=request.env)
+    return host.id
+
+
+@activity.defn
+async def write_remote(request: StdinWrite) -> None:
+    host = await hosts.get(request.handle)
+    files = CliFiles("/tmp", request.session_id)
+    await host.exec(files.write_stdin_command(request.number), stdin=request.text)
+
+
+@activity.defn
+async def watch_remote(request: WatchRequest) -> None:
+    host = await hosts.get(request.handle)
+    files = CliFiles("/tmp", request.session_id)
+
+    async def running() -> bool:
+        return not await host.exists(files.exit)
+
+    def follow(path: str) -> Callable[[int], AsyncIterator[bytes]]:
+        return lambda offset: follow_lines(
+            lambda at: host.read(path, at), running, offset, poll_interval=1
+        )
+
+    await watch_output(
+        request.session_id,
+        stdout=follow(files.stdout),
+        exit_status=lambda: host.read_exit_status(files.exit),
+        stderr=follow(files.stderr),
+        stream_topic=request.stream_topic,
+        signal_stderr=request.signal_stderr,
+    )
+
+
+@activity.defn
+async def stop_remote(request: StopRequest) -> None:
+    if request.handle is not None:  # None if launch never finished
+        host = await hosts.get(request.handle)
+        await host.exec(CliFiles("/tmp", request.session_id).stop_command())
+```
+
+Run `launch_command` in a process group of its own, as most exec APIs do, so `stop_command` stops
+everything Claude Code started. `follow_lines` turns reads of a growing file into the lines
+`watch_output` sends. Here `running` checks only the `exit` file. To also notice when Claude Code
+is lost, such as when its host restarts, run `status_command` now and then.
+
+#### Wiring It Up
+
+Group the Activities, then pass them to the transport in the Workflow and to the plugin on the
+Worker:
+
+```python
+from temporalio.claude_agent_sdk import TemporalTransport, TransportActivities
+
+REMOTE_ACTIVITIES = TransportActivities(
+    launch=launch_remote,
+    write_stdin=write_remote,
+    watch_output=watch_remote,
+    stop=stop_remote,
+)
+
+# In the Workflow
+transport = TemporalTransport(options, REMOTE_ACTIVITIES)
+async with ClaudeSDKClient(options=options, transport=transport) as client:
+    ...
+
+# On the Worker
+ClaudeAgentSDKPlugin(activities=REMOTE_ACTIVITIES)
+```
+
+Pass the transport the same `options` as the client.
+
+### Secrets
+
+`ClaudeAgentOptions.env` reaches Claude Code as Activity input, so it is recorded in Workflow
+history. Don't put secrets in it.
+
+Set secrets such as `ANTHROPIC_API_KEY` where Claude Code runs instead. By default, Claude Code
+inherits the Worker's environment, which never passes through an Activity.
 
 ## Callbacks
 
 Approvals, custom tools, and hooks run in your Workflow, so they can use everything a Workflow
 can: wait days for a person's input through a Signal or Update, execute Activities with retries
-and timeouts, or set a timer. Because they run in the Workflow, callbacks must
-be deterministic.
+and timeouts, or set a timer. Like all Workflow code, they must be deterministic.
 
 ### Tool Approval
 
@@ -181,7 +278,7 @@ class GovernedAgentWorkflow:
             allowed_tools=["Read", "Glob", "Grep"],
             can_use_tool=self.approve,
         )
-        transport = TemporalTransport(options, sandbox="my-sandbox")
+        transport = TemporalTransport(options)
         async with ClaudeSDKClient(options=options, transport=transport) as client:
             await client.query(prompt)
             async for _ in client.receive_response():
@@ -267,7 +364,7 @@ class ProgressWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> str:
         options = ClaudeAgentOptions()
-        transport = TemporalTransport(options, sandbox="my-sandbox")
+        transport = TemporalTransport(options)
         async with ClaudeSDKClient(options=options, transport=transport) as client:
             await client.query(prompt)
             async for message in client.receive_response():
@@ -296,11 +393,15 @@ Each message Claude Code writes reaches the Workflow as one Signal, as soon as i
 
 ### Token-by-Token Output
 
-To stream Claude's output as it's generated, set `include_partial_messages` and pass the
-transport a topic of the Workflow's stream. Each `StreamEvent` goes to that topic for callers
-outside the Workflow: the Workflow itself doesn't get them, but still gets every complete message.
+To stream Claude's output as it's generated, set `include_partial_messages`, and pass the
+transport a `stream` topic of the Workflow's stream. Each `StreamEvent` goes
+to that topic for callers outside the Workflow: the Workflow itself doesn't get them, but still
+gets every complete message.
 
 ```python
+from temporalio.claude_agent_sdk import TemporalTransport
+
+
 @workflow.defn
 class StreamingWorkflow:
     @workflow.init
@@ -310,7 +411,9 @@ class StreamingWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> str:
         options = ClaudeAgentOptions(include_partial_messages=True)
-        transport = TemporalTransport(options, sandbox="my-sandbox", stream=self.events)
+        transport = TemporalTransport(
+            options, stream=self.events
+        )
         async with ClaudeSDKClient(options=options, transport=transport) as client:
             await client.query(prompt)
             async for message in client.receive_response():
@@ -319,41 +422,24 @@ class StreamingWorkflow:
         return ""
 ```
 
-Callers subscribe to `events` as above; each item's data is a `stream_event` message. If a Worker
-fails, a caller may see a few events again. `include_partial_messages` and `stream` go together:
+Callers subscribe to `events` as above; each item's data is a `stream_event` message. A custom
+transport takes `stream` the same way. If a Worker fails, a caller may see a few events again. `include_partial_messages` and `stream` go together:
 passing one without the other raises `ValueError`.
 
 ## Hardening
 
-By default, the transport stops Claude Code's file tools (Edit, Write) from changing the session
-transcripts that resuming a session reads. Bash isn't covered. To protect the transcripts from Bash
-too, turn on Claude Code's Bash sandbox. It's off by default because it changes how Bash works:
+Consider these additional protections when running Claude Code unattended.
 
-- Bash can write only to the workspace and the temp directory.
-- Connecting to a host not in `sandbox.network.allowedDomains` asks `can_use_tool`.
-- Sandboxed Bash commands are approved without asking, unless you set
-  `autoAllowBashIfSandboxed` to `false`.
-- Rules in `disallowed_tools` stop applying to Bash; put your rules in `settings` instead.
+### Restrict access outside the workspace
 
-```python
-import json
+Configure Claude Code's permission rules and Bash sandbox to restrict access outside the workspace.
+Claude's [permissions](https://code.claude.com/docs/en/permissions) control its built-in file tools,
+while [sandboxing](https://code.claude.com/docs/en/sandboxing) restricts Bash commands and the
+processes they start.
 
-from claude_agent_sdk import ClaudeAgentOptions
+### Run Claude Code outside the Worker
 
-options = ClaudeAgentOptions(
-    settings=json.dumps(
-        {
-            "sandbox": {
-                "enabled": True,
-                # No retrying a command outside the sandbox with dangerouslyDisableSandbox.
-                "allowUnsandboxedCommands": False,
-                # Fail instead of running Bash unsandboxed when the sandbox can't start.
-                "failIfUnavailable": True,
-            }
-        }
-    ),
-)
-```
-
-Pass `settings` as a JSON string; the transport can't combine `ClaudeAgentOptions.sandbox` with a
-settings file.
+Claude Code can do anything the Worker's user can on its host. For stronger isolation, run Claude
+Code in a separate container, VM, or remote environment. Use a
+[custom transport](#custom-transport) whose Activities communicate with that environment instead of
+launching Claude Code on the Worker.
