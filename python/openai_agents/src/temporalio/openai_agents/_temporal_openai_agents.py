@@ -9,10 +9,10 @@ import types
 import typing
 import warnings
 from collections.abc import (
-    AsyncIterator,
+    AsyncGenerator,
     Callable,
     Collection,
-    Iterator,
+    Generator,
     Mapping,
     Sequence,
 )
@@ -1184,7 +1184,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
             )
 
         @asynccontextmanager
-        async def run_context() -> AsyncIterator[None]:
+        async def run_context() -> AsyncGenerator[None, None]:
             if mcp_activities:
                 async with mcp_activities.run_context():
                     with self.tracing_context():
@@ -1212,7 +1212,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         )
 
     @contextmanager
-    def tracing_context(self) -> Iterator[None]:
+    def tracing_context(self) -> Generator[None, None, None]:
         """Context manager for setting up OpenAI Agents tracing instrumentation.
 
         This should be called if AgentsSDK traces and/or spans are started outside of the context of a worker.
