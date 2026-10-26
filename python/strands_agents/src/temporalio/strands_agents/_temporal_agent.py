@@ -1,10 +1,11 @@
-from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
 
 from strands import Agent
 from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent, HookCallback
+from strands.types.agent import AgentInput
+from strands.types.content import Messages
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
@@ -142,21 +143,21 @@ class TemporalAgent(Agent):
             else:
                 reg.register_tool(tool)
 
-    async def stream_async(
-        self, prompt: Any = None, **kwargs: Any
-    ) -> AsyncIterator[Any]:
-        """Load the worker-side model's config, then run Strands' ``stream_async``.
+    async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
+        """Load the worker-side model's config, then convert the prompt.
 
         Strands reads the model's context window limit for proactive
         compression and its model id for tracing in workflow code, before the
-        first model call.
+        first model call. ``stream_async`` awaits this method first after it
+        takes the invocation lock and registers the idempotency token, and
+        before it starts the agent span. Loading here keeps Strands' rejection,
+        deduplication and cancellation of overlapping invocations unchanged.
         """
         if workflow.patched(_MODEL_CONFIG_PATCH):
             await self._temporal_model._load_config()
             if self._temporal_model.stateful:
                 self._use_server_side_state()
-        async for event in super().stream_async(prompt, **kwargs):
-            yield event
+        return await super()._convert_prompt_to_messages(prompt)
 
     def _use_server_side_state(self) -> None:
         # What Strands' Agent does at construction for a stateful model, which

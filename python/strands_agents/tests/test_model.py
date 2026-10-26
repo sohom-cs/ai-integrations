@@ -74,8 +74,40 @@ class ModelConfigWorkflow:
         agent = TemporalAgent(
             model="configured", start_to_close_timeout=timedelta(seconds=15)
         )
+        # The config loads inside Strands' invocation guard, so the guard
+        # rejects an overlapping first invocation, as it does natively.
+        first, second = await asyncio.gather(
+            agent.invoke_async(prompt),
+            agent.invoke_async(prompt),
+            return_exceptions=True,
+        )
         await agent.invoke_async(prompt)
+
+        # A duplicate of a first invocation that is cancelled while the config
+        # loads is aborted, not run; the next invocation reuses the read.
+        other = TemporalAgent(
+            model="configured", start_to_close_timeout=timedelta(seconds=15)
+        )
+        primary = asyncio.create_task(
+            other.invoke_async("cancelled", idempotency_token="t")
+        )
+        duplicate = asyncio.create_task(
+            other.invoke_async("duplicate", idempotency_token="t")
+        )
+        await asyncio.sleep(0)
+        primary.cancel()
+        cancelled = await asyncio.gather(primary, duplicate, return_exceptions=True)
+        await other.invoke_async(prompt)
         return {
+            "invocations": [str(first), type(second).__name__],
+            "cancelled": [type(r).__name__ for r in cancelled],
+            "prompts": [
+                block["text"]
+                for message in other.messages
+                if message["role"] == "user"
+                for block in message["content"]
+                if "text" in block
+            ],
             "context_window_limit": agent.model.context_window_limit,
             "config": agent.model.get_config(),
         }
@@ -84,8 +116,13 @@ class ModelConfigWorkflow:
 async def test_model_config_reaches_workflow(client: Client):
     """Workflow code sees the worker model's id and context window limit."""
     task_queue = f"test_model_config_reaches_workflow-{uuid4()}"
+    # One spare response, so a duplicate that wrongly runs fails the asserts.
     plugin = StrandsPlugin(
-        models={"configured": lambda: ConfiguredMockModel(["Done!"])}
+        models={
+            "configured": lambda: ConfiguredMockModel(
+                ["Done!", "Again!", "Later!", "Spare!"]
+            )
+        }
     )
 
     async with Worker(
@@ -102,14 +139,26 @@ async def test_model_config_reaches_workflow(client: Client):
             task_queue=task_queue,
         )
         assert await handle.result() == {
+            "invocations": ["Done!\n", "ConcurrencyException"],
+            "cancelled": ["CancelledError", "IdempotencyAbortedError"],
+            "prompts": ["Hello"],
             "context_window_limit": 1000,
             "config": {"model_id": "mock-1", "context_window_limit": 1000},
         }
 
+    history = await handle.fetch_history()
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "invoke_model",
+        "strands_get_model_config",
+        "invoke_model",
+    ]
+
     await Replayer(
         workflows=[ModelConfigWorkflow],
         plugins=[plugin],
-    ).replay_workflow(await handle.fetch_history())
+    ).replay_workflow(history)
 
 
 class StatefulMockModel(MockModel):
