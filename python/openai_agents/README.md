@@ -239,12 +239,15 @@ The plugin automatically handles several important setup tasks:
 - Configures OpenAI Agents SDK to run model calls as Temporal activities.
 
 OpenAI's response models can lag behind live API payloads, so a value that holds a model response
-may fail strict validation when it is decoded. The plugin then builds the drifted parts without
-validation and keeps the declared types around them: a Pydantic model or dataclass you declare, the
-lists, dicts and models in its fields, and the OpenAI and Agents SDK types inside them. Earlier
-versions returned such a value as a plain `dict`. Workflow code that worked around that by reading
-the `dict` behaves differently after an upgrade, so keep runs that started on an earlier version on
-it with Worker Versioning, or let them finish first.
+may fail strict validation when it is decoded. The plugin then validates a Pydantic model or
+dataclass you declare again, with its own config and validators and those of an `Annotated` type
+you declare it in, and builds only the OpenAI models that fail without validation. An instance
+that a validator returns is kept or revalidated as Pydantic would. Inside a union, it builds a
+variant only if it is the one whose kind and type tag fit the value and that validates; a
+variant's validators that change the value, an OpenAI model's included, run before its kind and
+tag are checked. Earlier versions returned such a value as a plain `dict`. Workflow code that
+worked around that by reading the `dict` behaves differently after an upgrade, so keep runs that
+started on an earlier version on it with Worker Versioning, or let them finish first.
 
 ### File 3: Client Execution (`run_hello_world_workflow.py`)
 
