@@ -5,7 +5,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { ApplicationFailure } from '@temporalio/common';
 import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, createBaseBundlerOptions, helpers, TestWorkflowEnvironment } from '@temporalio/test-helpers';
-import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
+import { bundleWorkflowCode, DefaultLogger, Worker, type WorkerOptions } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
@@ -193,6 +193,36 @@ test('TemporalAgent without `model:` resolves to the single registered factory',
     });
     t.is(result, 'reply from default');
   });
+});
+
+test('StrandsPlugin refuses to replace a caller Activity, but not its own', (t) => {
+  type Activities = Record<string, unknown>;
+  const plugin = new StrandsPlugin({
+    models: { onlyModel: () => new StubModel([]) },
+    mcpClients: { beta: () => new StubMcpClient([]) },
+  });
+  const callerActivity = async (): Promise<string> => 'caller';
+
+  for (const name of ['invokeModel', 'beta-callTool']) {
+    t.throws(
+      () => plugin.configureWorker({ taskQueue: 'q', activities: { [name]: callerActivity } } as WorkerOptions),
+      {
+        instanceOf: TypeError,
+        message:
+          `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity ` +
+          'with this name. Rename or remove the other registration.',
+      }
+    );
+  }
+
+  // Caller Activities with other names stay beside the plugin's.
+  const once = plugin.configureWorker({ taskQueue: 'q', activities: { lookUp: callerActivity } } as WorkerOptions);
+  t.is((once.activities as Activities).lookUp, callerActivity);
+
+  // Worker.create runs configureWorker twice when one instance is on both the NativeConnection
+  // and the Worker.
+  const twice = plugin.configureWorker(once);
+  t.is((twice.activities as Activities).invokeModel, (once.activities as Activities).invokeModel);
 });
 
 test('invokeModel reconstructs Message instances from wire data', async (t) => {

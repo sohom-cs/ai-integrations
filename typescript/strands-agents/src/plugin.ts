@@ -2,7 +2,7 @@ import type { McpClient } from '@strands-agents/sdk';
 import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
-import type { BundleOptions } from '@temporalio/worker';
+import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import { ModelActivity } from './model-activity';
 import type { InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
@@ -13,6 +13,10 @@ import {
   listToolsActivityName,
   _evictConnection,
 } from './temporal-mcp-client';
+
+// Every Activity function a StrandsPlugin builds. configureWorker lets these be replaced, so one
+// instance can be on both the NativeConnection and the Worker.
+const pluginActivityFunctions = new WeakSet<object>();
 
 /**
  * Options for {@link StrandsPlugin}.
@@ -61,6 +65,8 @@ export interface StrandsPluginOptions {
  * ```
  */
 export class StrandsPlugin extends SimplePlugin {
+  private readonly activityNames: readonly string[];
+
   constructor(options: StrandsPluginOptions = {}) {
     let modelFactories = options.models;
     let defaultName: string | undefined;
@@ -86,6 +92,9 @@ export class StrandsPlugin extends SimplePlugin {
       activities[listToolsActivityName(server)] = buildListToolsActivity(server, factory, idleMs);
       activities[callToolActivityName(server)] = buildCallToolActivity(server, factory, idleMs);
     }
+    for (const fn of Object.values(activities)) {
+      pluginActivityFunctions.add(fn);
+    }
 
     const runContext = async (next: () => Promise<void>): Promise<void> => {
       try {
@@ -107,6 +116,21 @@ export class StrandsPlugin extends SimplePlugin {
         failureConverterPath: require.resolve('./failure-converter'),
       },
     });
+    this.activityNames = Object.keys(activities);
+  }
+
+  override configureWorker(options: WorkerOptions): WorkerOptions {
+    const existing = options.activities as Record<string, unknown> | undefined;
+    for (const name of this.activityNames) {
+      const fn = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
+      if (typeof fn === 'function' && !pluginActivityFunctions.has(fn)) {
+        throw new TypeError(
+          `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity ` +
+            'with this name. Rename or remove the other registration.'
+        );
+      }
+    }
+    return super.configureWorker(options);
   }
 
   /**
