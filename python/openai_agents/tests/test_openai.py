@@ -1366,6 +1366,12 @@ def workflow_tool_mock_model():
     return TestModel.returning_responses(
         [
             ResponseBuilders.tool_call("{}", "run_tool"),
+            ResponseBuilders.tool_call(
+                '{"note":"call back"}',
+                "add_note",
+                call_id="call-add-note",
+                item_id="item-add-note",
+            ),
             ResponseBuilders.output_message("Workflow tool was used"),
         ]
     )
@@ -1373,23 +1379,35 @@ def workflow_tool_mock_model():
 
 @workflow.defn
 class WorkflowToolWorkflow:
+    def __init__(self) -> None:
+        self.notes: list[str] = []
+
     @workflow.run
-    async def run(self) -> None:
+    async def run(self) -> list[str]:
         agent: Agent = Agent(
             name="Assistant",
             instructions="You are a helpful assistant.",
             model="gpt-4o",
-            tools=[function_tool(self.run_tool)],
+            tools=[function_tool(self.run_tool), function_tool(self.add_note)],
         )
         await Runner.run(
             agent,
             "My phone number is 650-123-4567. Where do you think I live?",
         )
+        # Acting on what a sync tool did ties this run's commands to the tool running.
+        if self.notes:
+            await workflow.sleep(timedelta(milliseconds=1))
+        return self.notes
 
     async def run_tool(self):
         print("Tool ran with self:", self)
         workflow.logger.info("Tool ran with self: %s", self)
         return None
+
+    def add_note(self, note: str) -> str:
+        """Add a note."""
+        self.notes.append(note)
+        return f"Added note: {note}"
 
 
 async def test_workflow_method_tools(client: Client):
@@ -1410,7 +1428,14 @@ async def test_workflow_method_tools(client: Client):
             id=f"workflow-tool-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        await workflow_handle.result()
+        # The sync tool ran in the Workflow, and the model got its result.
+        assert await workflow_handle.result() == ["call back"]
+        model_inputs = [
+            e.activity_task_scheduled_event_attributes.input.payloads[0].data.decode()
+            async for e in workflow_handle.fetch_history_events()
+            if e.HasField("activity_task_scheduled_event_attributes")
+        ]
+        assert "Added note: call back" in model_inputs[-1]
 
 
 async def test_response_serialization():

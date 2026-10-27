@@ -14,6 +14,7 @@ from tests.test_openai import (
     OutputGuardrailWorkflow,
     ResearchWorkflow,
     ToolsWorkflow,
+    WorkflowToolWorkflow,
 )
 
 
@@ -27,6 +28,8 @@ from tests.test_openai import (
         "output-guardrail-workflow-history.json",
         "research-workflow-history.json",
         "tools-workflow-history.json",
+        # Recorded before sync function tools ran in the Workflow: the sync tool failed.
+        "workflow-tool-workflow-history.json",
     ],
 )
 async def test_replay(file_name: str) -> None:
@@ -46,6 +49,7 @@ async def test_replay(file_name: str) -> None:
                 HelloWorldAgent,
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,
+                WorkflowToolWorkflow,
             ],
             plugins=[OpenAIAgentsPlugin()],
         ).replay_workflow(WorkflowHistory.from_json("fake", history_json))
