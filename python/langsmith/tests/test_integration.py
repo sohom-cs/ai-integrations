@@ -641,40 +641,6 @@ class TestReplay:
             )
         assert result == "fallback"
 
-    async def test_no_patch_marker_without_plugin(
-        self,
-        client: Client,
-        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A worker without the plugin, in a process with it, records no marker."""
-        # Or LangChain would trace the worker without the plugin on its own.
-        monkeypatch.setenv("LANGSMITH_TRACING", "false")
-        temporal_client, _, _ = _make_client_and_collector(client)
-        # Unsandboxed, both workflows use the langchain_core the plugin hooks.
-        runner = UnsandboxedWorkflowRunner()
-        async with (
-            new_worker(
-                temporal_client, LangChainSignalWorkflow, workflow_runner=runner
-            ) as traced,
-            new_worker(
-                client, LangChainSignalWorkflow, workflow_runner=runner
-            ) as untraced,
-        ):
-            for worker, marked in ((traced, True), (untraced, False)):
-                handle = await client.start_workflow(
-                    LangChainSignalWorkflow.run,
-                    id=f"replay-test-{uuid.uuid4()}",
-                    task_queue=worker.task_queue,
-                )
-                await handle.signal(LangChainSignalWorkflow.release)
-                assert await handle.result() == "secret"
-                history = await handle.fetch_history()
-                assert marked == any(
-                    e.event_type == EventType.EVENT_TYPE_MARKER_RECORDED
-                    for e in history.events
-                )
-
     async def test_buffered_processing_after_worker_restart(
         self,
         client: Client,

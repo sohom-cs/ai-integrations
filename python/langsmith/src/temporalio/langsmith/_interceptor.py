@@ -249,11 +249,6 @@ def _uuid_from_random(rng: random.Random) -> uuid.UUID:
 # ---------------------------------------------------------------------------
 
 
-# Version gate: workflows whose history lacks this marker keep the tracing
-# they started with, so their replays run the same code as before.
-_LANGCHAIN_RUNS_PATCH_ID = "temporal-langsmith-langchain-replay"
-
-
 class _LangChainRuns:
     """Stable IDs for the runs LangChain's tracer makes in one workflow.
 
@@ -346,10 +341,8 @@ class _LangChainRuns:
 def _get_langchain_runs() -> _LangChainRuns | None:
     """Get the current workflow's ``_LangChainRuns``.
 
-    Returns ``None`` outside a workflow, in read-only (query) contexts, for
-    a workflow whose history predates this tracing (see
-    ``_LANGCHAIN_RUNS_PATCH_ID``), or when workflow APIs are mocked (unit
-    tests).
+    Returns ``None`` outside a workflow, in read-only (query) contexts, or
+    when workflow APIs are mocked (unit tests).
     """
     try:
         if not temporalio.workflow.in_workflow():
@@ -359,13 +352,9 @@ def _get_langchain_runs() -> _LangChainRuns | None:
         inst = temporalio.workflow.instance()
         runs = getattr(inst, "__temporal_langsmith_langchain_runs", None)
         if runs is None:
-            runs = (
-                _LangChainRuns()
-                if temporalio.workflow.patched(_LANGCHAIN_RUNS_PATCH_ID)
-                else False
-            )
+            runs = _LangChainRuns()
             setattr(inst, "__temporal_langsmith_langchain_runs", runs)
-        return runs if isinstance(runs, _LangChainRuns) else None
+        return runs
     except Exception:
         return None
 
@@ -377,8 +366,7 @@ def _stable_run_ids(generate: Callable[..., Any], version: int) -> Callable[...,
     """Wrap a LangChain run ID generator to use ``_LangChainRuns.new_id``.
 
     It calls ``generate`` outside the tracing context this plugin sets for
-    workflow code, such as in a workflow on a worker without the plugin,
-    and for workflows that predate this tracing.
+    workflow code, such as in a workflow on a worker without the plugin.
     """
 
     def generate_run_id(*args: Any, **kwargs: Any) -> Any:
