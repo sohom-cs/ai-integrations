@@ -9,10 +9,14 @@ via the configured stream topic.
 import asyncio
 import logging
 import uuid
+import weakref
 from collections.abc import AsyncIterator
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
+import openai._models
+import pydantic
 import pytest
 from agents import (
     Agent,
@@ -28,6 +32,7 @@ from agents import (
     TResponseInputItem,
     Usage,
 )
+from agents.exceptions import ModelBehaviorError
 from agents.items import TResponseStreamEvent
 from agents.models import get_default_model_settings
 from openai.types.responses import (
@@ -47,10 +52,11 @@ from openai.types.shared import Reasoning
 from openai.types.shared.response_format_text import ResponseFormatText
 
 from temporalio import workflow
-from temporalio.client import Client, WorkflowFailureError
+from temporalio.client import Client, WorkflowFailureError, WorkflowHistory
 from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
-from temporalio.openai_agents import ModelActivityParameters
+from temporalio.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
 from temporalio.openai_agents.testing import AgentEnvironment
+from temporalio.worker import Replayer
 from tests.helpers import new_worker
 
 logger = logging.getLogger(__name__)
@@ -173,6 +179,55 @@ class StreamingTestModel(Model):
         )
 
 
+class DriftedStreamingTestModel(StreamingTestModel):
+    """Streams a final event that fails the openai SDK's strict validation.
+
+    Its usage has no ``cache_write_tokens``, which the SDK requires, as when the
+    API stops sending a field.
+    """
+
+    __test__ = False
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        async for event in super().stream_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        ):
+            if isinstance(event, ResponseCompletedEvent) and event.response.usage:
+                event.response.usage.input_tokens_details = (
+                    InputTokensDetails.model_construct(cached_tokens=0)
+                )
+            yield event
+
+
+def empty_openai_discriminator_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from the openai discriminator cache of a fresh process.
+
+    The openai SDK fills this cache when it parses an event that fails strict
+    validation, so a Worker process that did not run the model Activity has it
+    empty.
+    """
+    monkeypatch.setattr(
+        openai._models, "DISCRIMINATOR_CACHE", weakref.WeakKeyDictionary()
+    )
+
+
 @workflow.defn
 class StreamingOpenAIWorkflow:
     """Test workflow that opts into streaming via ``Runner.run_streamed``.
@@ -205,6 +260,26 @@ class StreamingOpenAIWorkflow:
     @workflow.query
     def get_workflow_event_types(self) -> list[str]:
         return self.workflow_event_types
+
+
+@workflow.defn
+class StreamingFallbackWorkflow:
+    """Takes another path when its streamed run fails, as Workflow code may."""
+
+    def __init__(self) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent[None](name="Assistant", instructions="You are a test agent.")
+        result = Runner.run_streamed(starting_agent=agent, input=prompt)
+        try:
+            async for _ in result.stream_events():
+                pass
+        except ModelBehaviorError:
+            await workflow.sleep(timedelta(milliseconds=10))
+            return "fallback"
+        return result.final_output
 
 
 @workflow.defn
@@ -294,6 +369,82 @@ async def test_streaming_publishes_raw_events(client: Client):
 
     # Workflow-side iteration sees the same model events in the same order.
     assert workflow_event_types == published_types
+
+
+@pytest.mark.asyncio
+async def test_streaming_drifted_event_in_fresh_process(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    """A final event that fails strict validation still decodes as itself.
+
+    The Worker process starts with an empty openai discriminator cache, as one
+    that did not run the model Activity, and the history then replays in
+    another such process.
+    """
+    with pytest.raises(pydantic.ValidationError):
+        InputTokensDetails.model_validate({"cached_tokens": 0})
+    empty_openai_discriminator_cache(monkeypatch)
+    async with AgentEnvironment(
+        model=DriftedStreamingTestModel(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client,
+            StreamingOpenAIWorkflow,
+            max_cached_workflows=0,
+            workflow_failure_exception_types=[ModelBehaviorError],
+        ) as worker:
+            handle = await client.start_workflow(
+                StreamingOpenAIWorkflow.run,
+                "Hello",
+                id=f"openai-streaming-drifted-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            assert await handle.result() == "Hello world!"
+            history = await handle.fetch_history()
+
+    empty_openai_discriminator_cache(monkeypatch)
+    await Replayer(
+        workflows=[StreamingOpenAIWorkflow],
+        plugins=[
+            OpenAIAgentsPlugin(
+                model_params=ModelActivityParameters(streaming_topic="events")
+            )
+        ],
+    ).replay_workflow(history)
+
+
+@pytest.mark.asyncio
+async def test_streaming_drifted_history_from_before_the_fix_replays(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A run recorded before this fix keeps its decoding on replay.
+
+    It read its drifted final event as another event, in a process with an
+    empty openai discriminator cache, and took its fallback path. Replayed in
+    the same state, it must take that path again.
+    """
+    empty_openai_discriminator_cache(monkeypatch)
+    history = WorkflowHistory.from_json(
+        "fake",
+        (
+            Path(__file__).with_name("histories")
+            / "streaming-fallback-workflow-history.json"
+        ).read_text(),
+    )
+    await Replayer(
+        workflows=[StreamingFallbackWorkflow],
+        plugins=[
+            OpenAIAgentsPlugin(
+                model_params=ModelActivityParameters(streaming_topic="events")
+            )
+        ],
+    ).replay_workflow(history)
 
 
 @pytest.mark.asyncio
