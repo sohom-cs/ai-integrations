@@ -1,10 +1,13 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { setTracingDisabled } from '@openai/agents-core';
-import type { MCPServer } from '@openai/agents-core';
+import type { MCPServer, Model, ModelProvider, ModelRequest, ModelResponse, StreamEvent } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
+import { Worker } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
   OpenAIAgentsPlugin,
@@ -13,6 +16,7 @@ import {
   StatelessMCPServerProvider,
 } from '..';
 import {
+  agentHooksWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -523,4 +527,58 @@ test('Streaming: useLocalActivity fails fast before scheduling an Activity', asy
     const result = await handle.result();
     t.is(result, 'StreamingLocalActivityUnsupported');
   });
+});
+
+/** Calls fetchValue, ends after the tool result, then answers a second turn with its instructions. */
+function hookProbeModelProvider(): ModelProvider {
+  let calls = 0;
+  const model: Model = {
+    async getResponse(request: ModelRequest): Promise<ModelResponse> {
+      calls++;
+      if (calls === 1) return toolCallResponse('fetchValue', { value: 'S-hook' });
+      if (calls === 2) return textResponse('done');
+      return textResponse(`next turn saw: ${request.systemInstructions}`);
+    },
+    // eslint-disable-next-line require-yield
+    async *getStreamedResponse(): AsyncIterable<StreamEvent> {
+      throw new Error('Streaming not supported');
+    },
+  };
+  return { getModel: () => model };
+}
+
+test('agent.on listeners run and their context writes reach later turns', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const plugin = new OpenAIAgentsPlugin({ modelProvider: hookProbeModelProvider() });
+  const worker = await createWorker({
+    plugins: [plugin],
+    activities: { fetchValue: async ({ value }: { value: string }) => value },
+  });
+
+  const result = await worker.runUntil(executeWorkflow(agentHooksWorkflow, { workflowExecutionTimeout: '30 seconds' }));
+
+  t.deepEqual(result.events, [
+    'agent_start:true',
+    'agent_tool_end:fetchValue',
+    'agent_end:done',
+    'agent_start:true',
+    'agent_end:next turn saw: hook=S-hook',
+  ]);
+  t.is(result.nextTurnOutput, 'next turn saw: hook=S-hook');
+});
+
+test('agent.on listeners stay off when replaying a run recorded before they were forwarded', async (t) => {
+  // Recorded with the plugin before this change: no listener ran, so the Workflow ended after one turn.
+  const history = JSON.parse(
+    readFileSync(path.resolve(__dirname, '../../src/__tests__/histories/agent-hooks-before-forwarding.json'), 'utf8')
+  );
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new OpenAIAgentsPlugin({ modelProvider: hookProbeModelProvider() })],
+      },
+      history
+    )
+  );
 });

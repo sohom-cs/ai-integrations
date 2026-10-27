@@ -135,3 +135,34 @@ test('convertAgent: wrappedOnInvoke calls original onInvokeHandoff and returns c
   t.true((returnedAgent as any).model instanceof ActivityBackedModel);
   t.not(returnedAgent, specialist);
 });
+
+test('convertAgent: forwardHooks re-emits lifecycle events on the original agents', (t) => {
+  const specialist = new Agent({ name: 'S', model: 'm' });
+  const triage = new Agent({ name: 'Triage', model: 'm', handoffs: [handoff(specialist)] });
+  const events: string[] = [];
+  triage.on('agent_start', (_ctx, agent) => events.push(`start:${agent === triage}`));
+  triage.on('agent_handoff', (_ctx, next) => events.push(`handoff:${next === specialist}`));
+  triage.on('agent_tool_end', (_ctx, tool, result) => events.push(`tool_end:${tool.name}:${result}`));
+  specialist.on('agent_end', (_ctx, output) => events.push(`end:${output}`));
+
+  const converted = convertAgent(triage, DEFAULT_MODEL_PARAMS, undefined, undefined, true);
+  const convertedSpecialist = (converted.handoffs[0] as Handoff<any, any>).agent;
+  const ctx = { context: {} } as any;
+  converted.emit('agent_start', ctx, converted);
+  converted.emit('agent_handoff', ctx, convertedSpecialist);
+  converted.emit('agent_tool_end', ctx, { name: 'fetch' } as any, 'value', { toolCall: {} as any });
+  convertedSpecialist.emit('agent_end', ctx, 'done');
+
+  t.deepEqual(events, ['start:true', 'handoff:true', 'tool_end:fetch:value', 'end:done']);
+});
+
+test('convertAgent: without forwardHooks, lifecycle events stay on the clone', (t) => {
+  const agent = new Agent({ name: 'X', model: 'm' });
+  const events: string[] = [];
+  agent.on('agent_start', () => events.push('start'));
+
+  const converted = convertAgent(agent, DEFAULT_MODEL_PARAMS);
+  converted.emit('agent_start', { context: {} } as any, converted);
+
+  t.deepEqual(events, []);
+});

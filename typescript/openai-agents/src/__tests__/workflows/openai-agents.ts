@@ -1,7 +1,7 @@
 import { Agent } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
+import { TemporalOpenAIRunner, activityAsTool, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
 export interface StreamingAgentResult {
   finalOutput: string;
@@ -175,4 +175,47 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
   } finally {
     await server.cleanup();
   }
+}
+
+export interface AgentHooksResult {
+  events: string[];
+  nextTurnOutput: string;
+}
+
+/**
+ * `agent.on(...)` listeners, as in the upstream lifecycle hooks guide. The tool-end
+ * listener writes the tool result into the run context, and a second turn runs only
+ * when it did, so the Workflow's commands depend on the hook.
+ */
+export async function agentHooksWorkflow(): Promise<AgentHooksResult> {
+  const fetchValue = activityAsTool<(input: { value: string }) => Promise<string>>({
+    name: 'fetchValue',
+    description: 'Fetch a value',
+    parameters: {
+      type: 'object',
+      properties: { value: { type: 'string' } },
+      required: ['value'],
+      additionalProperties: false,
+    },
+  });
+  const agent = new Agent<{ hookValue?: string }>({
+    name: 'HookAgent',
+    instructions: (runContext) => `hook=${runContext.context.hookValue ?? ''}`,
+    model: 'gpt-4o-mini',
+    tools: [fetchValue],
+  });
+  const events: string[] = [];
+  agent.on('agent_start', (_ctx, started) => events.push(`agent_start:${started === agent}`));
+  agent.on('agent_tool_end', (runContext, tool, result) => {
+    events.push(`agent_tool_end:${tool.name}`);
+    runContext.context.hookValue = result;
+  });
+  agent.on('agent_end', (_ctx, output) => events.push(`agent_end:${output}`));
+
+  const runner = new TemporalOpenAIRunner();
+  const context: { hookValue?: string } = {};
+  await runner.run(agent, 'go', { context });
+  if (context.hookValue === undefined) return { events, nextTurnOutput: '' };
+  const next = await runner.run(agent, 'again', { context });
+  return { events, nextTurnOutput: next.finalOutput ?? '' };
 }

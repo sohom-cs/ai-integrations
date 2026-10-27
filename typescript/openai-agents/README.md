@@ -722,6 +722,7 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Sessions                | Supported                | Via `WorkflowSafeMemorySession`; upstream `MemorySession` is rejected                          |
 | Run state and approvals | Supported                | Serialize with `result.state.toString()` and rehydrate with `RunState.fromString`              |
 | Guardrails              | Supported                | Guardrail callbacks must be deterministic                                                      |
+| Agent lifecycle hooks   | Supported                | `agent.on(...)` listeners run in the Workflow and must be deterministic                        |
 | Tracing                 | Supported                | OpenAI hosted traces, custom `TracingProcessor`s, OTel, and optional `temporal:*` spans        |
 | Agent context           | Supported                | Activity tools receive a copy                                                                  |
 | `continueAsNew`         | Supported                | Plugin config propagates to the continuation                                                   |

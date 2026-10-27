@@ -6,13 +6,15 @@ import { ActivityBackedModel } from './activity-backed-model';
 /**
  * Recursively converts an agent graph: validate tools, replace each agent's
  * model with an ActivityBackedModel, and clone handoffs. Uses a seen-map to
- * handle circular handoff references.
+ * handle circular handoff references. With `forwardHooks`, each clone re-emits
+ * its lifecycle events on the original agent, where `agent.on(...)` listeners live.
  */
 export function convertAgent(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   seen?: Map<Agent<any, any>, Agent<any, any>>,
-  modelNameOverride?: string
+  modelNameOverride?: string,
+  forwardHooks = false
 ): Agent<any, any> {
   seen = seen ?? new Map();
   if (seen.has(agent)) return seen.get(agent)!;
@@ -59,15 +61,43 @@ export function convertAgent(
 
   const converted = agent.clone({ model: activityBackedModel });
   seen.set(agent, converted);
+  if (forwardHooks) forwardAgentHooks(converted, agent, seen);
 
   const convertedHandoffs = (agent.handoffs ?? []).map((h) => {
     if (h instanceof Handoff) {
-      const convertedHandoffAgent = convertAgent(h.agent, modelParams, seen, modelNameOverride);
+      const convertedHandoffAgent = convertAgent(h.agent, modelParams, seen, modelNameOverride, forwardHooks);
       return h.clone({ agent: convertedHandoffAgent });
     }
-    return convertAgent(h, modelParams, seen, modelNameOverride);
+    return convertAgent(h, modelParams, seen, modelNameOverride, forwardHooks);
   });
 
   converted.handoffs = convertedHandoffs;
   return converted;
+}
+
+/**
+ * The run loop emits lifecycle events on the clone, which has its own event
+ * emitter. Re-emit them on the original agent, with agent arguments mapped
+ * back to the caller's agents, as the upstream Runner would pass them.
+ */
+function forwardAgentHooks(
+  converted: Agent<any, any>,
+  original: Agent<any, any>,
+  seen: Map<Agent<any, any>, Agent<any, any>>
+): void {
+  const toOriginal = (a: Agent<any, any>): Agent<any, any> => {
+    for (const [from, to] of seen) if (to === a) return from;
+    return a;
+  };
+  converted.on('agent_start', (context, agent, turnInput) =>
+    original.emit('agent_start', context, toOriginal(agent), turnInput)
+  );
+  converted.on('agent_end', (context, output) => original.emit('agent_end', context, output));
+  converted.on('agent_handoff', (context, nextAgent) => original.emit('agent_handoff', context, toOriginal(nextAgent)));
+  converted.on('agent_tool_start', (context, tool, details) =>
+    original.emit('agent_tool_start', context, tool, details)
+  );
+  converted.on('agent_tool_end', (context, tool, result, details) =>
+    original.emit('agent_tool_end', context, tool, result, details)
+  );
 }

@@ -19,6 +19,7 @@ import {
 } from '@openai/agents-core';
 import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
+import { patched } from '@temporalio/workflow';
 import {
   DEFAULT_MODEL_ACTIVITY_OPTIONS,
   STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
@@ -34,6 +35,13 @@ import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
 const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
+
+/**
+ * Runs that started before agent lifecycle hooks reached `agent.on(...)` listeners
+ * keep skipping them on replay: a listener that writes the run context can change
+ * the commands that follow.
+ */
+const FORWARD_AGENT_HOOKS_PATCH = 'openai-agents.forward-agent-hooks';
 
 export interface TemporalRunOptions<TContext = undefined> {
   /** Run context passed to agents and tools */
@@ -271,7 +279,8 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride);
+    const forwardHooks = patched(FORWARD_AGENT_HOOKS_PATCH);
+    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride, forwardHooks);
     if (options?.runConfig?.sandbox !== undefined) {
       propagateAgentToolSandboxConfig(converted, options.runConfig.sandbox);
     }
