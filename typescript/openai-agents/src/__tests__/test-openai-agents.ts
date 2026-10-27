@@ -1,7 +1,14 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
-import { setTracingDisabled } from '@openai/agents-core';
-import type { MCPServer } from '@openai/agents-core';
+import {
+  addTraceProcessor,
+  getCurrentTrace,
+  getGlobalTraceProvider,
+  setTracingDisabled,
+  withCustomSpan,
+  withTrace,
+} from '@openai/agents-core';
+import type { MCPServer, Model, ModelProvider, Span, SpanData, TracingProcessor } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
@@ -11,6 +18,7 @@ import {
   OpenAIAgentsTraceClientInterceptor,
   StatefulMCPServerProvider,
   StatelessMCPServerProvider,
+  type TracingApiKeyContext,
 } from '..';
 import {
   localActivityAgentWorkflow,
@@ -23,6 +31,7 @@ import {
   streamingAgentWorkflow,
   streamingLocalActivityWorkflow,
   streamingNoTopicWorkflow,
+  tracingApiKeyWorkflow,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
 import { FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
@@ -523,4 +532,103 @@ test('Streaming: useLocalActivity fails fast before scheduling an Activity', asy
     const result = await handle.result();
     t.is(result, 'StreamingLocalActivityUnsupported');
   });
+});
+
+// A model whose call opens a span in the model Activity, as real models do with their generation span.
+class SpanningModelProvider implements ModelProvider {
+  getModel(): Model {
+    return {
+      getResponse: () => withCustomSpan(async () => textResponse('done'), { data: { name: 'model-call' } }),
+      getStreamedResponse: () => {
+        throw new Error('not used');
+      },
+    };
+  }
+}
+
+test('tracingApiKey gives spans that cross a Temporal boundary the key the Worker resolves', async (t) => {
+  const { createWorker, taskQueue } = helpers(t);
+
+  getGlobalTraceProvider().setDisabled(false);
+  const ended: Array<{ traceId: string; name: string; key: string | undefined }> = [];
+  const recorder: TracingProcessor = {
+    onTraceStart: async () => {},
+    onTraceEnd: async () => {},
+    onSpanStart: async () => {},
+    onSpanEnd: async (span: Span<SpanData>) => {
+      const data = span.spanData;
+      ended.push({
+        traceId: span.traceId,
+        name: data.type === 'custom' ? data.name : data.type,
+        key: span.tracingApiKey,
+      });
+    },
+    forceFlush: async () => {},
+    shutdown: async () => {},
+  };
+  addTraceProcessor(recorder);
+
+  const runWorkflowId = `tracing-key-run-${Date.now()}`;
+  const traceWorkflowId = `tracing-key-trace-${Date.now()}`;
+  const contexts: TracingApiKeyContext[] = [];
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new SpanningModelProvider(),
+        tracingApiKey: (context) => {
+          contexts.push(context);
+          if (context.workflowId === runWorkflowId) return 'sk-resolved-run';
+          if (context.workflowId === traceWorkflowId) return 'sk-resolved-trace';
+          return undefined;
+        },
+      }),
+    ],
+  });
+  const wfClient = new WorkflowClient({
+    connection: (t.context as any).env.connection,
+    interceptors: [new OpenAIAgentsTraceClientInterceptor()],
+  });
+
+  let clientTraceId = '';
+  await worker.runUntil(async () => {
+    // The run sets its own key in Workflow code.
+    await wfClient.execute(tracingApiKeyWorkflow, {
+      taskQueue,
+      workflowId: runWorkflowId,
+      args: ['sk-run'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    // The client starts the Workflow inside a trace with its own key.
+    await withTrace(
+      'tracing-key-client-trace',
+      async () => {
+        clientTraceId = getCurrentTrace()!.traceId;
+        await wfClient.execute(tracingApiKeyWorkflow, {
+          taskQueue,
+          workflowId: traceWorkflowId,
+          workflowExecutionTimeout: '30 seconds',
+        });
+      },
+      { tracingApiKey: 'sk-client' }
+    );
+  });
+
+  const runTraceId = contexts.find((c) => c.workflowId === runWorkflowId && c.traceName !== undefined)?.traceId;
+  t.truthy(runTraceId, 'the resolver should be asked about the run trace in the model Activity');
+  const keysIn = (traceId: string | undefined, name: string) =>
+    ended.filter((s) => s.traceId === traceId && s.name === name).map((s) => s.key);
+  // Workflow spans reach the Worker through a sink after each Workflow Task, so wait for them.
+  for (let i = 0; i < 50 && keysIn(clientTraceId, 'agent').length === 0; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  t.deepEqual(keysIn(runTraceId, 'model-call'), ['sk-resolved-run'], 'Activity span of a run with its own key');
+  t.deepEqual(keysIn(runTraceId, 'agent'), ['sk-run'], 'the run keeps its own key on its Workflow spans');
+  t.deepEqual(keysIn(clientTraceId, 'model-call'), ['sk-resolved-trace'], 'Activity span in a keyed client trace');
+  t.deepEqual(keysIn(clientTraceId, 'agent'), ['sk-resolved-trace'], 'Workflow span in a keyed client trace');
+  t.like(
+    contexts.find((c) => c.traceId === runTraceId && c.traceName !== undefined),
+    { workflowId: runWorkflowId, workflowType: 'tracingApiKeyWorkflow' },
+    'the Activity context names the Workflow that scheduled it'
+  );
 });

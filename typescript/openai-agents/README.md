@@ -612,6 +612,19 @@ addTraceProcessor(new BatchTraceProcessor(new OpenAITracingExporter()));
 
 **Warning**: Using `setDefaultOpenAITracingExporter()` after constructing the plugin will break plugin internals. Either call it before constructing the plugin, or use `addTraceProcessor` as described above.
 
+### Tracing keys per run
+
+The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. The plugin does not write tracing keys into Workflow history, so a trace that crosses a Temporal boundary arrives without its key. A key a run sets in Workflow code with `tracing: { apiKey }` still applies to that run's Workflow spans. Spans made in Activities and Nexus handlers, and the Workflow spans of a trace that a Client started with `tracingApiKey`, use the exporter's default key.
+
+To send those spans with another key, resolve it on the Worker with `tracingApiKey`. It gets the trace ID, and when known the trace name and the Workflow ID and type, and returns a key or `undefined` for the default:
+
+```ts
+const plugin = new OpenAIAgentsPlugin({
+  modelProvider: new OpenAIProvider(),
+  tracingApiKey: ({ workflowId }) => (workflowId?.startsWith('tenant-a-') ? tenantATracingKey : undefined),
+});
+```
+
 ### OpenTelemetry
 
 Install `@opentelemetry/sdk-trace-base` before importing the OTel subpath:
