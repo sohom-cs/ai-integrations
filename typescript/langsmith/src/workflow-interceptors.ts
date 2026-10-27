@@ -190,7 +190,7 @@ function bodyAmbient(
   parent: ReplaySafeRunTree | undefined,
   generateNewUuid4?: () => string
 ): ReplaySafeRunTree {
-  if (!run.noDestination) {
+  if (!run.untraced) {
     return run;
   }
   return parent ?? placeholderRoot(config, generateNewUuid4);
@@ -461,7 +461,7 @@ class LangSmithWorkflowOutbound implements WorkflowOutboundCallsInterceptor {
     if (this.config.addTemporalRuns && ambient instanceof ReplaySafeRunTree) {
       const marker = await emitMarker(this.config, ambient, name, { args: input.args ?? [] });
       // A marker with no destination is never propagated, so the remote handler nests under the ambient run instead.
-      propagate = marker.noDestination ? ambient : marker;
+      propagate = marker.untraced ? ambient : marker;
     }
     const headers = withContextHeader(input.headers, runHeaders(propagate));
     return next(headers);

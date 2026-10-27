@@ -164,9 +164,9 @@ export function asOutputs(result: unknown): Record<string, unknown> {
   return { result };
 }
 
-/** True for a run the workflow isolate built with no destination (see {@link ReplaySafeRunTree.noDestination}). */
-function hasNoDestination(run: RunTree): boolean {
-  return (run as { noDestination?: boolean }).noDestination === true;
+/** True for a run the workflow isolate built with no destination (see {@link ReplaySafeRunTree.untraced}). */
+function isUntraced(run: RunTree): boolean {
+  return (run as { untraced?: boolean }).untraced === true;
 }
 
 /**
@@ -175,7 +175,7 @@ function hasNoDestination(run: RunTree): boolean {
  * a run built in an env it can't use, such as a client marker.
  */
 export function runHeaders(run: RunTree | undefined): LangSmithTraceContext | undefined {
-  if (!run || run.tracingEnabled === false || hasNoDestination(run)) {
+  if (!run || run.tracingEnabled === false || isUntraced(run)) {
     return undefined;
   }
   return run.toHeaders() as LangSmithTraceContext;
@@ -265,17 +265,19 @@ export class ReplaySafeRunTree extends RunTree {
   // subtree mints from one factory.
   protected readonly generateNewUuid4?: () => string;
   /**
-   * True for a run that is never emitted or propagated. With no plugin `projectName` and a Worker env LangSmith can't
-   * address, that's every Temporal-operation run the isolate builds and the placeholder root, plus any child of such
-   * a run that names no project or address of its own. LangSmith still fills in a project for such a run,
-   * `"default"` inside the isolate, which goes unused.
+   * Set when the plugin has no `projectName` and LangSmith rejected the env the workflow bundle was built in, on the
+   * plugin's own runs in the workflow sandbox, and inherited by each child that names no project or address of its own.
+   * Such a run is never sent or put in a trace header: the plugin, having no destination, sends none of its own sandbox
+   * runs, wherever they sit, and in that env LangSmith doesn't trace runs that name no destination. LangSmith's
+   * `tracingEnabled: false` won't do, since {@link emitMarkerRun} skips its awaits for a run with tracing off, so the
+   * workflow's awaits would vary with the env and break replay.
    */
-  readonly noDestination: boolean;
+  readonly untraced: boolean;
 
-  constructor(config: RunTreeConfig, generateNewUuid4?: () => string, noDestination = false) {
+  constructor(config: RunTreeConfig, generateNewUuid4?: () => string, untraced = false) {
     super(ReplaySafeRunTree.fill(config, generateNewUuid4));
     this.generateNewUuid4 = generateNewUuid4;
-    this.noDestination = noDestination;
+    this.untraced = untraced;
   }
 
   private static fill(config: RunTreeConfig, generateNewUuid4?: () => string): RunTreeConfig {
@@ -303,10 +305,10 @@ export class ReplaySafeRunTree extends RunTree {
   }
 
   /**
-   * Produce a replay-safe child so deeply-nested `traceable` runs stay deterministic. With `noDestination`, the child
+   * Produce a replay-safe child so deeply-nested `traceable` runs stay deterministic. With `untraced`, the child
    * is flagged as having no destination even under a run that has one.
    */
-  override createChild(config: RunTreeConfig, noDestination = false): ReplaySafeRunTree {
+  override createChild(config: RunTreeConfig, untraced = false): ReplaySafeRunTree {
     const namesDestination = Boolean(config.project_name || config.address);
     const child = new ReplaySafeRunTree(
       {
@@ -318,7 +320,7 @@ export class ReplaySafeRunTree extends RunTree {
         ...(namesDestination ? {} : { project_name: this.project_name, address: this.address }),
       },
       this.generateNewUuid4,
-      noDestination || (this.noDestination && !namesDestination)
+      untraced || (this.untraced && !namesDestination)
     );
     this.child_runs.push(child);
     return child;
@@ -326,7 +328,7 @@ export class ReplaySafeRunTree extends RunTree {
 
   /** Emit a `createRun` via the Sink, unless replaying or the run has no destination. */
   override async postRun(): Promise<void> {
-    if (isReplaying() || this.noDestination) {
+    if (isReplaying() || this.untraced) {
       return;
     }
     sinks()[LANGSMITH_SINK_NAME].createRun(serializeRun(this));
@@ -337,7 +339,7 @@ export class ReplaySafeRunTree extends RunTree {
    * destination.
    */
   override async patchRun(): Promise<void> {
-    if (isReplaying() || this.noDestination) {
+    if (isReplaying() || this.untraced) {
       return;
     }
     sinks()[LANGSMITH_SINK_NAME].updateRun(serializeRun(this));
@@ -365,10 +367,10 @@ export class ReplaySafeRunTree extends RunTree {
  */
 export class _RootReplaySafeRunTreeFactory extends ReplaySafeRunTree {
   /**
-   * Produce a replay-safe child with no link back to this factory; `noDestination` as for
+   * Produce a replay-safe child with no link back to this factory; `untraced` as for
    * {@link ReplaySafeRunTree.createChild}.
    */
-  override createChild(config: RunTreeConfig, noDestination = false): ReplaySafeRunTree {
+  override createChild(config: RunTreeConfig, untraced = false): ReplaySafeRunTree {
     const namesDestination = Boolean(config.project_name || config.address);
     return new ReplaySafeRunTree(
       {
@@ -378,7 +380,7 @@ export class _RootReplaySafeRunTreeFactory extends ReplaySafeRunTree {
         ...(namesDestination ? {} : { project_name: this.project_name, address: this.address }),
       },
       this.generateNewUuid4,
-      noDestination || (this.noDestination && !namesDestination)
+      untraced || (this.untraced && !namesDestination)
     );
   }
 
