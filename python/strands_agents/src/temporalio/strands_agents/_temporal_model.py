@@ -105,7 +105,7 @@ class TemporalModel(Model):
         """Return the worker-side model's ``model_id`` and ``context_window_limit``.
 
         They are empty until ``TemporalAgent`` loads them before its first
-        invocation, and stay empty in runs that started before this was added.
+        invocation.
         """
         return dict(self._config)
 
