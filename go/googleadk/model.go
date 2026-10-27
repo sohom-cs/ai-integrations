@@ -106,7 +106,7 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			yield(nil, errMissingContext)
 			return
 		}
-		if err := rejectRemoteAgents(ctx, wfCtx); err != nil {
+		if err := rejectRemoteAgents(ctx); err != nil {
 			yield(nil, err)
 			return
 		}
@@ -140,25 +140,17 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 	}
 }
 
-// remoteAgentChangeID is the workflow.GetVersion change ID of the remote agent
-// check. Runs that passed the check's place before it existed keep running
-// their remote agents, so their histories still replay.
-const remoteAgentChangeID = "googleadk-reject-remote-agents"
-
 // rejectRemoteAgents returns an error when an agent below the agent making
 // this model call was built by ADK's remoteagent.NewA2A. That agent fetches its
 // card and sends its messages from Workflow code, which History does not
 // record, so a replay sends them again.
-func rejectRemoteAgents(ctx context.Context, wfCtx workflow.Context) error {
+func rejectRemoteAgents(ctx context.Context) error {
 	ic, ok := ctx.(agent.InvocationContext)
 	if !ok {
 		return nil
 	}
 	remote := findRemoteAgent(ic.Agent())
 	if remote == nil {
-		return nil
-	}
-	if workflow.GetVersion(wfCtx, remoteAgentChangeID, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
 		return nil
 	}
 	return fmt.Errorf("googleadk: agent %q is a remote A2A agent; it sends its requests from "+

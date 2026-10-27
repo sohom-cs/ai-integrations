@@ -481,9 +481,6 @@ an upgrade would newly pass through ungated.
   runs on model calls, so it misses a remote agent that runs before any model
   call, such as a remote root agent.
 
-  Runs that passed this check's place before it existed keep their remote
-  agents, so their histories still replay (`workflow.GetVersion` change ID
-  `googleadk-reject-remote-agents`). An earlier version of this package cannot
-  replay a run that took the check. To roll back, keep this version and set
-  `worker.Options.PreferredVersionProvider` to return `workflow.DefaultVersion`
-  for that change ID: new runs then keep their remote agents.
+  An open run that made such a model call on an earlier version fails to replay
+  on this one with a non-determinism error. Let those runs finish before you
+  upgrade, or keep them on the earlier version with Worker Versioning.
