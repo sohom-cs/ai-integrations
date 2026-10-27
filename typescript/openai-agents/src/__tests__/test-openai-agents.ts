@@ -1,10 +1,13 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
+import { Worker } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
   OpenAIAgentsPlugin,
@@ -13,6 +16,7 @@ import {
   StatelessMCPServerProvider,
 } from '..';
 import {
+  customHandoffWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -25,7 +29,7 @@ import {
   streamingNoTopicWorkflow,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
-import { FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
+import { FakeModelProvider, handoffResponse, textResponse, toolCallResponse } from './stubs/openai-agents';
 import { StreamingFakeModelProvider, streamingTextEvents } from './stubs/openai-agents-fakes';
 import EventType = temporal.api.enums.v1.EventType;
 
@@ -523,4 +527,47 @@ test('Streaming: useLocalActivity fails fast before scheduling an Activity', asy
     const result = await handle.result();
     t.is(result, 'StreamingLocalActivityUnsupported');
   });
+});
+
+const deskActivities = {
+  standardDesk: async () => 'standard desk',
+  vipDesk: async () => 'vip desk',
+};
+
+test('A custom Handoff hands off to the agent its callback returns', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const modelProvider = new FakeModelProvider([
+    handoffResponse('transfer_to_desk'),
+    textResponse('vip answer'),
+    handoffResponse('transfer_to_desk'),
+    textResponse('standard answer'),
+  ]);
+  const worker = await createWorker({
+    plugins: [new OpenAIAgentsPlugin({ modelProvider })],
+    activities: deskActivities,
+  });
+
+  const results = await worker.runUntil(async () => [
+    await executeWorkflow(customHandoffWorkflow, { args: ['vip'], workflowExecutionTimeout: '30 seconds' }),
+    await executeWorkflow(customHandoffWorkflow, { args: ['standard'], workflowExecutionTimeout: '30 seconds' }),
+  ]);
+
+  t.deepEqual(results, ['vip: vip answer', 'standard: standard answer']);
+});
+
+test('A custom Handoff keeps its agent field when replaying a run recorded before the fix', async (t) => {
+  // Recorded with the plugin before this change: the callback returned vip, but the run went to
+  // standard, whose model called its standardDesk tool.
+  const history = JSON.parse(
+    readFileSync(path.resolve(__dirname, '../../src/__tests__/histories/custom-handoff-before-fix.json'), 'utf8')
+  );
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })],
+      },
+      history
+    )
+  );
 });

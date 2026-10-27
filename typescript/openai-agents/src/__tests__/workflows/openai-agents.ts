@@ -1,7 +1,7 @@
-import { Agent } from '@openai/agents-core';
+import { Agent, Handoff } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
+import { TemporalOpenAIRunner, activityAsTool, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
 export interface StreamingAgentResult {
   finalOutput: string;
@@ -175,4 +175,29 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
   } finally {
     await server.cleanup();
   }
+}
+
+/**
+ * A custom `Handoff` whose callback picks the desk from the run context, as the
+ * upstream handoffs guide describes. Each desk has its own Activity tool.
+ */
+export async function customHandoffWorkflow(tier: string): Promise<string> {
+  const deskTool = (name: string) =>
+    activityAsTool<(input: Record<string, never>) => Promise<string>>({
+      name,
+      description: `Look up the ${name} desk`,
+      parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    });
+  const standard = new Agent<{ tier: string }>({
+    name: 'standard',
+    model: 'gpt-4o-mini',
+    tools: [deskTool('standardDesk')],
+  });
+  const vip = new Agent<{ tier: string }>({ name: 'vip', model: 'gpt-4o-mini', tools: [deskTool('vipDesk')] });
+  const desk = new Handoff(standard, async (runContext) => (runContext.context.tier === 'vip' ? vip : standard));
+  desk.toolName = 'transfer_to_desk';
+  desk.toolDescription = 'Route to the right desk';
+  const router = new Agent<{ tier: string }>({ name: 'router', model: 'gpt-4o-mini', handoffs: [desk] });
+  const result = await new TemporalOpenAIRunner().run(router, 'help', { context: { tier } });
+  return `${result.lastAgent?.name}: ${result.finalOutput}`;
 }
