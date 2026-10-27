@@ -25,6 +25,47 @@ import {
 
 export type MCPServerProvider = StatelessMCPServerProvider | StatefulMCPServerProvider;
 
+type WebpackConfig = Parameters<NonNullable<BundleOptions['webpackConfigHook']>>[0];
+type WebpackCompiler = Parameters<Extract<NonNullable<WebpackConfig['plugins']>[number], (...args: any[]) => void>>[0];
+
+const AGENTS_CORE_REQUEST = /^@openai\/agents-core(?:\/|$)/;
+
+/**
+ * `@openai/agents-core` has a CommonJS build and an ES module build. The plugin's own code is
+ * CommonJS, so it loads the CommonJS build. An `import` in Workflow code, such as a `.ts`
+ * Workflow file, loads the ES module build too, and that build's dynamic `import()` becomes an
+ * async chunk. Webpack's automatic public path for that chunk throws while the bundle loads in the
+ * Workflow sandbox, so the Worker cannot start.
+ *
+ * Only such a bundle is rebuilt, in a second pass that resolves every request for the package as
+ * a CommonJS request, which keeps one copy and no chunk. A bundle that loads today, with one copy
+ * or two, stays as it is, so open runs replay with the code they started on.
+ */
+function resolveAgentsCoreAsCommonJsIfBundleCannotLoad(compiler: WebpackCompiler): void {
+  let commonJsPass = false;
+  compiler.hooks.thisCompilation.tap('OpenAIAgentsPlugin', (compilation) => {
+    compilation.hooks.needAdditionalPass.tap('OpenAIAgentsPlugin', () => {
+      if (commonJsPass) return false;
+      for (const module of compilation.modules) {
+        if (module.constructor.name === 'AutoPublicPathRuntimeModule') {
+          commonJsPass = true;
+          // Resolve again instead of reusing the first pass's resolutions.
+          compiler.options.module.unsafeCache = false;
+          return true;
+        }
+      }
+      return false;
+    });
+  });
+  compiler.hooks.normalModuleFactory.tap('OpenAIAgentsPlugin', (factory) => {
+    factory.hooks.beforeResolve.tap('OpenAIAgentsPlugin', (data) => {
+      if (commonJsPass && data.dependencyType === 'esm' && AGENTS_CORE_REQUEST.test(data.request)) {
+        data.dependencyType = 'commonjs';
+      }
+    });
+  });
+}
+
 /**
  * Options controlling trace interceptor behavior on both the Activity side
  * (directly) and the Workflow side (via header propagation).
@@ -187,7 +228,8 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
           : existingEntry !== undefined
             ? [existingEntry as string]
             : [];
-        return { ...cfg, entry: [polyfillPath, ...entries] };
+        const plugins = [...(cfg.plugins ?? []), resolveAgentsCoreAsCommonJsIfBundleCannotLoad];
+        return { ...cfg, entry: [polyfillPath, ...entries], plugins };
       },
     };
   }
