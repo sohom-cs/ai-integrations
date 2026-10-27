@@ -66,7 +66,11 @@ from temporalio.openai_agents._temporal_model_provider import (
 from temporalio.openai_agents._temporal_model_stub import (
     _TemporalModelStub,  # pyright: ignore[reportPrivateUsage]
 )
-from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
+from temporalio.openai_agents.testing import (
+    AgentEnvironment,
+    ResponseBuilders,
+    TestModelProvider,
+)
 from tests.helpers import new_worker
 
 
@@ -460,6 +464,27 @@ class ResumeAcrossContinueAsNewWorkflow:
             f"continued={workflow.info().continued_run_id is not None}",
             *await _approve_and_resume(agent, state, streamed=False),
         ]
+
+
+@workflow.defn
+class ResumeWithWorkflowModelProviderWorkflow:
+    """Resume a restored state with a workflow-safe ``model_provider`` set on the run.
+
+    On 1.1.0 the resumed model call ran in the workflow through that provider instead of as an
+    activity. ``test_replay`` keeps histories of such runs replaying.
+    """
+
+    @workflow.run
+    async def run(self) -> str:
+        agent = _make_banker()
+        result = await Runner.run(agent, "Move 5 dollars.")
+        state = await RunState.from_string(agent, result.to_state().to_string())
+        for interruption in state.get_interruptions():
+            state.approve(interruption)
+        config = RunConfig(
+            model_provider=TestModelProvider(ScriptedModel(_banker_reply))
+        )
+        return str((await Runner.run(agent, state, run_config=config)).final_output)
 
 
 @workflow.defn

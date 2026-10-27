@@ -124,6 +124,19 @@ def _convert_agent(
     return new_agent
 
 
+_RESTORED_STATE_PATCH_ID = "openai_agents.restored-run-state-model-provider"
+
+
+def _resumes_restored_state(input: object) -> bool:
+    """Whether ``input`` is a RunState whose current agent the plugin has not converted."""
+    if not isinstance(input, RunState):
+        return False
+    current_agent = input._current_agent  # pyright: ignore[reportPrivateUsage]
+    return current_agent is not None and not isinstance(
+        current_agent.model, _TemporalModelStub
+    )
+
+
 def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
     """Check if any agent in the graph (following direct Agent handoffs) is a SandboxAgent."""
     if seen is None:
@@ -179,6 +192,7 @@ class TemporalOpenAIRunner(AgentRunner):
     def _prepare_workflow_run(
         self,
         starting_agent: Agent[TContext],
+        input: str | list[TResponseInputItem] | RunState[TContext],
         kwargs: RunOptions[TContext],
     ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
@@ -235,7 +249,13 @@ class TemporalOpenAIRunner(AgentRunner):
                 ),
             )
 
-        run_config = install_model_provider(self.model_params, run_config)
+        # A RunState restored from JSON holds the caller's own agents. Before the Temporal
+        # model provider was installed, their model calls did not run as activities, so runs
+        # that resumed such a state replay on that path.
+        if not _resumes_restored_state(input) or workflow.patched(
+            _RESTORED_STATE_PATCH_ID
+        ):
+            run_config = install_model_provider(self.model_params, run_config)
 
         # run_config.sandbox is global for the entire run — configure it if any agent needs it.
         if _has_sandbox_agent(starting_agent) or run_config.sandbox:
@@ -283,7 +303,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(
+            starting_agent, input, kwargs
+        )
 
         with capture_scope(run_config.model_settings):
             try:
@@ -355,7 +377,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(
+            starting_agent, input, kwargs
+        )
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.

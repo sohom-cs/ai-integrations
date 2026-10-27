@@ -15,6 +15,7 @@ from tests.test_openai import (
     ResearchWorkflow,
     ToolsWorkflow,
 )
+from tests.test_openai_run_state import ResumeWithWorkflowModelProviderWorkflow
 
 
 @pytest.mark.parametrize(
@@ -26,6 +27,7 @@ from tests.test_openai import (
         "input-guardrail-workflow-history.json",
         "output-guardrail-workflow-history.json",
         "research-workflow-history.json",
+        "resume-with-workflow-model-provider-workflow-history.json",
         "tools-workflow-history.json",
     ],
 )
@@ -46,6 +48,7 @@ async def test_replay(file_name: str) -> None:
                 HelloWorldAgent,
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,
+                ResumeWithWorkflowModelProviderWorkflow,
             ],
             plugins=[OpenAIAgentsPlugin()],
         ).replay_workflow(WorkflowHistory.from_json("fake", history_json))
