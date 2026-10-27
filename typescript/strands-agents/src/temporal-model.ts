@@ -14,12 +14,6 @@ import type {
 export const GET_MODEL_CONFIG_ACTIVITY = 'strandsGetModelConfig';
 
 /**
- * Patch that marks the runs in which agents read the worker model's config. Agents in runs recorded
- * before it keep an empty config, so their histories replay unchanged.
- */
-export const MODEL_CONFIG_PATCH = 'strands-agents.model-config';
-
-/**
  * Options for {@link TemporalModel}.
  *
  * The {@link ActivityOptions} are applied to every activity invocation
@@ -74,18 +68,13 @@ export class TemporalModel extends Model<BaseModelConfig> {
   /**
    * Read the worker model's id and context window through an activity, once per instance, so that
    * Strands' traces and proactive compression use the real model's values. {@link TemporalAgent}
-   * calls this before Strands initializes the agent. Gated by {@link MODEL_CONFIG_PATCH}.
+   * calls this before Strands initializes the agent.
    *
-   * Returns `undefined`, without awaiting anything, when there is nothing to read: the config was
-   * already read, or the run took the path without the patch. Callers can then go on synchronously
-   * and keep the command order of runs recorded before the patch.
+   * Returns `undefined`, without awaiting anything, when the config was already read, so callers
+   * can go on synchronously.
    */
   loadConfig(): Promise<void> | undefined {
     if (this.configLoaded) return undefined;
-    if (!workflow.patched(MODEL_CONFIG_PATCH)) {
-      this.configLoaded = true;
-      return undefined;
-    }
     const activities = workflow.proxyActivities<{
       [GET_MODEL_CONFIG_ACTIVITY](input: GetModelConfigInput): Promise<ModelConfigInfo>;
     }>({
