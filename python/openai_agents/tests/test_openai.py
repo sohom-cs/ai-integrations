@@ -5,7 +5,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import nexusrpc
 import pydantic
@@ -2547,11 +2547,19 @@ async def test_output_type(client: Client):
 @workflow.defn
 class McpServerWorkflow:
     @workflow.run
-    async def run(self, caching: bool, factory_argument: Any | None) -> str:
+    async def run(
+        self,
+        caching: bool,
+        factory_argument: Any | None,
+        require_approval: Literal["always"] | None,
+    ) -> str:
         from agents.mcp import MCPServer  # type: ignore[reportUnusedImport]
 
         server: MCPServer = openai_agents.workflow.stateless_mcp_server(
-            "HelloServer", cache_tools_list=caching, factory_argument=factory_argument
+            "HelloServer",
+            cache_tools_list=caching,
+            factory_argument=factory_argument,
+            require_approval=require_approval,
         )
         agent = Agent[str](
             name="MCP ServerWorkflow",
@@ -2561,13 +2569,20 @@ class McpServerWorkflow:
         result = await Runner.run(
             starting_agent=agent, input="Say hello to Tom and Tim."
         )
+        if result.interruptions:
+            return f"Approval needed: {result.interruptions[0].tool_name}"
         return result.final_output
 
 
 @workflow.defn
 class McpServerStatefulWorkflow:
     @workflow.run
-    async def run(self, timeout: timedelta, factory_argument: Any | None) -> str:
+    async def run(
+        self,
+        timeout: timedelta,
+        factory_argument: Any | None,
+        require_approval: Literal["always"] | None,
+    ) -> str:
         async with openai_agents.workflow.stateful_mcp_server(
             "HelloServer",
             config=ActivityConfig(
@@ -2575,6 +2590,7 @@ class McpServerStatefulWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             ),
             factory_argument=factory_argument,
+            require_approval=require_approval,
         ) as server:
             agent = Agent[str](
                 name="MCP ServerWorkflow",
@@ -2584,6 +2600,8 @@ class McpServerStatefulWorkflow:
             result = await Runner.run(
                 starting_agent=agent, input="Say hello to Tom and Tim."
             )
+            if result.interruptions:
+                return f"Approval needed: {result.interruptions[0].tool_name}"
             return result.final_output
 
 
@@ -2697,11 +2715,18 @@ def test_legacy_mcp_apis_are_deprecated():
 
 @pytest.mark.parametrize(
     "mode",
-    ["stateful", "stateless", "stateless-cached"],
+    [
+        "stateful",
+        "stateless",
+        "stateless-cached",
+        "stateful-approval",
+        "stateless-approval",
+    ],
 )
 async def test_mcp_server(client: Client, mode: str):
-    stateful = mode == "stateful"
+    stateful = mode.startswith("stateful")
     caching = mode == "stateless-cached"
+    require_approval = "always" if mode.endswith("-approval") else None
 
     from agents.mcp import MCPServer  # type: ignore
 
@@ -2732,7 +2757,7 @@ async def test_mcp_server(client: Client, mode: str):
             if stateful:
                 result = await client.execute_workflow(
                     McpServerStatefulWorkflow.run,
-                    args=[timedelta(seconds=30), None],
+                    args=[timedelta(seconds=30), None, require_approval],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
@@ -2740,13 +2765,17 @@ async def test_mcp_server(client: Client, mode: str):
             else:
                 result = await client.execute_workflow(
                     McpServerWorkflow.run,
-                    args=[caching, None],
+                    args=[caching, None, require_approval],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
                 )
-        assert result == "Hi Tom and Tim!"
     print(tracking_server.calls)
+    if require_approval:
+        assert result == "Approval needed: Say-Hello"
+        assert "call_tool" not in tracking_server.calls
+        return
+    assert result == "Hi Tom and Tim!"
     if stateful:
         assert tracking_server.calls == [
             "connect",
@@ -2823,7 +2852,7 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
             if stateful:
                 await client.execute_workflow(
                     McpServerStatefulWorkflow.run,
-                    args=[timedelta(seconds=30), headers],
+                    args=[timedelta(seconds=30), headers, None],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
@@ -2831,7 +2860,7 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
             else:
                 await client.execute_workflow(
                     McpServerWorkflow.run,
-                    args=[False, headers],
+                    args=[False, headers, None],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
@@ -2859,7 +2888,7 @@ async def test_stateful_mcp_server_no_worker(client: Client):
         ) as worker:
             workflow_handle = await client.start_workflow(
                 McpServerStatefulWorkflow.run,
-                args=[timedelta(seconds=1), None],
+                args=[timedelta(seconds=1), None, None],
                 id=f"mcp-server-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=30),
