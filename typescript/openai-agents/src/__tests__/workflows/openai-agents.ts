@@ -1,5 +1,5 @@
-import { Agent } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/workflow';
+import { Agent, tool } from '@openai/agents-core';
+import { ApplicationFailure, sleep } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -175,4 +175,50 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
   } finally {
     await server.cleanup();
   }
+}
+
+interface ResumeContext {
+  original: string;
+  after?: string;
+}
+
+export interface ApprovalResumeContextResult {
+  callerAfter: string | undefined;
+  resumedUsesCallerObject: boolean;
+}
+
+/**
+ * Approves a tool that writes the run context, resumes the same `RunState`, then reads the
+ * caller's context object. It sleeps only when the write reached that object, so a change in
+ * where the write lands also changes the Workflow's commands.
+ */
+export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
+  const setAfter = tool({
+    name: 'set_after',
+    description: 'Set a value after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async (args, runContext) => {
+      (runContext!.context as ResumeContext).after = (args as { value: string }).value;
+      return 'ok';
+    },
+  });
+  const agent = new Agent<ResumeContext>({
+    name: 'ResumeContextAgent',
+    instructions: 'Set the value.',
+    model: 'gpt-4o-mini',
+    tools: [setAfter],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const ctx: ResumeContext = { original: 'orig' };
+  const first = await runner.run(agent, 'go', { context: ctx });
+  first.state.approve(first.interruptions[0]!);
+  const resumed = await runner.run(agent, first.state);
+  if (ctx.after !== undefined) await sleep(1);
+  return { callerAfter: ctx.after, resumedUsesCallerObject: resumed.runContext.context === ctx };
 }
