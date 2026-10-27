@@ -8,6 +8,7 @@ from temporalio.openai_agents import OpenAIAgentsPlugin
 from temporalio.worker import Replayer
 from tests.test_openai import (
     AgentsAsToolsWorkflow,
+    CarriedItemsWorkflow,
     CustomerServiceWorkflow,
     HelloWorldAgent,
     InputGuardrailWorkflow,
@@ -21,6 +22,7 @@ from tests.test_openai import (
     "file_name",
     [
         "agents-as-tools-workflow-history.json",
+        "carried-items-workflow-history.json",
         "customer-service-workflow-history.json",
         "hello-workflow-history.json",
         "input-guardrail-workflow-history.json",
@@ -43,6 +45,7 @@ async def test_replay(file_name: str) -> None:
                 ToolsWorkflow,
                 CustomerServiceWorkflow,
                 AgentsAsToolsWorkflow,
+                CarriedItemsWorkflow,
                 HelloWorldAgent,
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,

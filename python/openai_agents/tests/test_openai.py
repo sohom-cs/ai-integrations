@@ -1123,6 +1123,48 @@ async def test_customer_service_workflow(client: Client):
             )
 
 
+@workflow.defn
+class CarriedItemsWorkflow:
+    """Runs a turn on items carried across Continue-As-New, as a chat does."""
+
+    @workflow.run
+    async def run(self, input_items: list[TResponseInputItem]) -> str:
+        try:
+            result = await Runner.run(
+                Agent(name="Assistant", instructions="Answer."),
+                input_items + [{"content": "Next", "role": "user"}],
+            )
+        except TypeError as e:
+            return f"Turn failed: {e}"
+        return result.final_output
+
+
+async def test_carried_input_items(client: Client):
+    # The assistant message's content decodes as a one-shot iterator.
+    input_items: list[TResponseInputItem] = [
+        {"content": "Hi", "role": "user"},
+        {
+            "id": "msg-carried",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+        },
+    ]
+    async with AgentEnvironment(model=hello_mock_model()) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, CarriedItemsWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedItemsWorkflow.run,
+                input_items,
+                id=f"carried-items-workflow-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            assert result == "test"
+
+
 class InputGuardrailModel(Model):
     __test__ = False
     responses: list[ModelResponse] = [

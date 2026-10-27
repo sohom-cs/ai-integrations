@@ -1,6 +1,6 @@
 import dataclasses
 import weakref
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Iterator
 from typing import Any, Callable
 
 from agents import (
@@ -161,6 +161,49 @@ def _coerce_run_config(value: object) -> RunConfig:
     return RunConfig(**value)
 
 
+_LIST_INPUT_ITERATORS_PATCH = "openai_agents.list-input-iterators"
+
+
+def _has_iterator(value: Any) -> bool:
+    if isinstance(value, Iterator):
+        return True
+    if isinstance(value, dict):
+        return any(_has_iterator(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_iterator(item) for item in value)
+    return False
+
+
+def _list_iterators(value: Any) -> Any:
+    """Replace iterators in ``value`` with lists, in place, and return it."""
+    if isinstance(value, Iterator):
+        return [_list_iterators(item) for item in value]
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _list_iterators(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _list_iterators(item)
+    return value
+
+
+def _make_input_copyable(input: object) -> None:
+    """Make input items decoded from a payload copyable.
+
+    Pydantic decodes ``Iterable`` fields of input items, such as an assistant
+    message's ``content``, as one-shot iterators. The framework deep-copies the
+    input of every run and cannot copy them, so the run raised ``TypeError``.
+    The items are rebuilt in place, so the caller's copy does not keep a used
+    iterator. Runs that started before this change keep the old behavior.
+    """
+    if (
+        isinstance(input, list)
+        and _has_iterator(input)
+        and workflow.patched(_LIST_INPUT_ITERATORS_PATCH)
+    ):
+        _list_iterators(input)
+
+
 class TemporalOpenAIRunner(AgentRunner):
     """Temporal Runner for OpenAI agents.
 
@@ -284,6 +327,7 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        _make_input_copyable(input)
 
         with capture_scope(run_config.model_settings):
             try:
@@ -356,6 +400,7 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        _make_input_copyable(input)
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
