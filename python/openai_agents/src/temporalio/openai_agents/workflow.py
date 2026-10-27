@@ -43,6 +43,9 @@ from temporalio.workflow import (
 if typing.TYPE_CHECKING:
     from agents.mcp import MCPServer
 
+# Runs that called a callable-class tool before this patch recorded the constructor's arguments.
+_CALLABLE_CLASS_CALL_SCHEMA_PATCH = "openai_agents.callable-class-call-schema"
+
 
 def _parse_tool_arguments(schema: FuncSchema, input: str | None) -> BaseModel:
     """Parse and validate model-supplied tool arguments.
@@ -128,7 +131,8 @@ def activity_as_tool(
     For undocumented arguments, refer to :py:mod:`workflow` and :py:meth:`start_activity`
 
     Args:
-        fn: A Temporal activity function to convert to a tool.
+        fn: A Temporal activity function to convert to a tool, a method passed as
+            ``Class.method``, or a callable-class activity passed as its class.
         strict_json_schema: Whether the tool should follow a strict schema.
             See https://openai.github.io/openai-agents-python/ref/tool/#agents.tool.FunctionTool.strict_json_schema
         failure_error_function: Formats the error text returned to the model
@@ -170,6 +174,20 @@ def activity_as_tool(
             "Input activity must have a name to be made into a tool",
             "invalid_tool",
         )
+    constructor_schema: FuncSchema | None = None
+    if inspect.isclass(fn):
+        try:
+            constructor_schema = function_schema(fn)
+        except Exception:
+            # Building the tool failed before the patch, so no run recorded a call to it.
+            pass
+        # Workflow code references a callable-class activity by its class, but the worker's
+        # registered instance runs __call__, so build the tool from __call__ without `self`.
+        call = functools.partial(fn.__call__, None)
+        setattr(call, "__name__", fn.__name__)
+        call.__annotations__ = getattr(fn.__call__, "__annotations__")
+        call.__doc__ = fn.__call__.__doc__ or fn.__doc__
+        fn = typing.cast(Callable, call)
     # If the provided callable has a first argument of `self`, partially apply it with the same metadata
     # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
     params = list(inspect.signature(fn).parameters.keys())
@@ -186,7 +204,20 @@ def activity_as_tool(
         fn = partial
     schema = function_schema(fn)
 
+    def run_schema() -> FuncSchema:
+        # Before the patch, a callable class's tool was built from its constructor. Runs that
+        # started then keep that tool, so their recorded tool calls replay.
+        if constructor_schema is None or temporal_workflow.patched(
+            _CALLABLE_CLASS_CALL_SCHEMA_PATCH
+        ):
+            return schema
+        return constructor_schema
+
+    # A tool built outside a workflow is shared by every run, so it offers the new schema.
+    offered_schema = run_schema() if temporal_workflow.in_workflow() else schema
+
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
+        schema = run_schema()
         try:
             params = _parse_tool_arguments(schema, input)
         except ModelBehaviorError as e:
@@ -221,9 +252,9 @@ def activity_as_tool(
             ) from e
 
     return FunctionTool(
-        name=schema.name,
-        description=schema.description or "",
-        params_json_schema=schema.params_json_schema,
+        name=offered_schema.name,
+        description=offered_schema.description or "",
+        params_json_schema=offered_schema.params_json_schema,
         on_invoke_tool=run_activity,
         strict_json_schema=strict_json_schema,
     )
