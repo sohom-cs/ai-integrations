@@ -24,13 +24,13 @@ Temporal provides durable orchestration for Claude agents:
 
 ## What's Included
 
-- **`ClaudeAgentSDKPlugin`**: Add it to your Worker to use Claude Code from your Workflows, as you
-  would with the Claude Agent SDK: `query()` for one-shot tasks where you know the prompt up front,
-  or `ClaudeSDKClient` for multi-turn conversations with follow-ups and interrupts.
-- **`TemporalTransport`**: The transport to pass `ClaudeSDKClient` and `query`. It launches Claude
-  Code and carries its input and output through the Activities you give it.
-- **`subprocess_activities()`**: The transport's default Activities, which run Claude Code in a
-  subprocess on the Worker. See [Subprocess Transport](#subprocess-transport).
+- **`ClaudeAgentSDKPlugin`**: Add it to your Worker to use the Claude Agent SDK in your Workflows.
+- **`TemporalTransport`**: The transport for the Claude Agent SDK in Workflows. It launches Claude
+  Code and carries its input and output through the plugin's Activities.
+- **`SubprocessConnector`**: The plugin's default connector, which runs Claude Code in a
+  subprocess of the Worker. See [Subprocess Connector](#subprocess-connector).
+- **`Connector`** and **`ClaudeCodeProcess`**: Implement these to run Claude Code somewhere else, such as
+  in a container. See [Custom Connector](#custom-connector).
 
 ## How It Works
 
@@ -39,10 +39,9 @@ Workflow drives it through the Claude Agent SDK's usual `ClaudeSDKClient`, and T
 step that fails.
 
 - **Activities move the messages.** The transport sends your messages to Claude Code through
-  Activities. A long-running Activity follows everything Claude Code writes and sends it to your
-  Workflow as Signals.
-- **The Activities decide where Claude Code runs.** By default, it runs on the Worker.
-  Your own Activities can run it anywhere they can reach.
+  Activities, and always has one Activity waiting for what Claude Code writes next.
+- **The connector decides where Claude Code runs.** By default, it runs on the Worker. Your own
+  connector can run it anywhere it can reach.
 
 ## Usage
 
@@ -50,8 +49,8 @@ step that fails.
 
 #### Workflow Side
 
-Use the Claude Agent SDK's own `ClaudeSDKClient` or `query` in the Workflow, as you would without
-Temporal, and pass it a Temporal `transport`. Pass the transport the same `options` as the client.
+Use the Claude Agent SDK in the Workflow as you would without Temporal, and pass it a Temporal
+`transport`. Pass the transport the same `options` as the client.
 
 ```python
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
@@ -92,147 +91,126 @@ worker = Worker(
 
 ## Transports
 
-Always pass `ClaudeSDKClient` and `query` a `transport` in a Workflow. Without one, the Claude
+Always pass the Claude Agent SDK a `transport` in a Workflow. Without one, the Claude
 Agent SDK would start Claude Code from Workflow code.
 
-Pass the transport the same `options` you pass the client. As in the Claude Agent SDK, the
-transport builds Claude Code's command line from them, so options you give only the client, such
-as `allowed_tools` or `mcp_servers`, never reach Claude Code.
+Pass the transport the same `options` you pass the client. The transport uses them to start and
+run Claude Code, and the client uses them for the conversation.
 
-### Subprocess Transport
+### Subprocess Connector
 
-By default, `TemporalTransport` uses `subprocess_activities()`, the Temporal counterpart of the
-Claude Agent SDK's default `SubprocessCLITransport`. They run Claude Code in a subprocess on the
-Worker that runs the launch Activity:
+By default, the plugin uses `SubprocessConnector`, which runs Claude Code with the Claude Agent
+SDK's own `SubprocessCLITransport` in the Worker process:
 
-- Claude Code runs as the Worker's user, with the Worker's environment, and works in the Worker's
-  files. Paths in `ClaudeAgentOptions`, such as `cwd` and `cli_path`, are on the Worker.
-- Claude Code runs apart from the Worker process. If only the Worker process restarts, Claude Code
-  keeps running, and the next Activity picks up its output where the last one stopped. If the
-  container or host restarts, Claude Code stops with it.
-- All of the Activities must run on the host Claude Code runs on. If your Workers run on several
-  hosts, pass the transport a `task_queue` that only one host polls.
+- As in the Claude Agent SDK, it finds Claude Code, checks its version, and runs it as the Worker's
+  user, with the Worker's environment, in the Worker's files. Paths in `ClaudeAgentOptions`, such
+  as `cwd` and `cli_path`, are on the Worker.
+- Claude Code stops when the Worker process does. The transport then raises `CLIConnectionError`.
+  To continue the conversation, start a new client with `options.resume` set to the session ID.
+- The plugin routes every Activity after the launch to the Worker process that runs Claude Code.
 
-`TemporalTransport` takes options such as `task_queue`, timeouts, and a retry policy:
+`TemporalTransport` takes options for each of its Activities, anything `workflow.execute_activity`
+takes, such as a task queue, timeouts, or a retry policy:
 
 ```python
 from temporalio.claude_agent_sdk import TemporalTransport
 
-transport = TemporalTransport(options, task_queue="claude-host-1")
+transport = TemporalTransport(
+    options, activity_options={"connect": {"task_queue": "claude"}}
+)
 async with ClaudeSDKClient(options=options, transport=transport) as client:
     ...
 ```
 
-### Custom Transport
+### Custom Connector
 
-To run Claude Code somewhere other than the Worker, such as on a remote host or in a container, write four
-Activities and pass them to `TemporalTransport`. The transport runs them; you don't write any
-Workflow code.
+To run Claude Code somewhere other than the Worker, such as in a container or on a remote host,
+give the plugin your own `Connector`. The transport and its Activities stay the same; you don't
+write any Workflow code or Activities.
 
-| Activity | Gets | Does | Returns |
-|---|---|---|---|
-| `launch` | `LaunchRequest` | Starts Claude Code with `args` and `env`, unless it already started | A handle, such as a host or container ID |
-| `write_stdin` | `StdinWrite` | Writes `text` to Claude Code's stdin as write `number` | |
-| `watch_output` | `WatchRequest` | Calls `watch_output`, which sends Claude Code's output to the Workflow until it exits | |
-| `stop` | `StopRequest` | Stops Claude Code and everything it started | |
+A connector has one method, `connect`. It gets a `ConnectActivityInput`, starts Claude Code with its
+`args` and `env`, and returns a `ClaudeCodeProcess`. The plugin keeps that process in the Worker
+process that started it and runs every Activity after the launch there, as with a pipe.
 
-Each request has the transport's `session_id`, and every request after `launch` has the `handle`
-it returned. Activities can be retried, so make each safe to run more than once.
+A `ClaudeCodeProcess` has `write`, `end_input`, `read`, and `close`. `read()` waits for Claude Code's next
+output, returns it with any more that is already there, and returns an empty list once Claude Code
+has exited with status 0. Raise the
+Claude Agent SDK's errors, such as `ProcessError` or `CLINotFoundError`, only for failures no retry
+can fix, and `CLIConnectionError` only once Claude Code is surely gone. Raise any other error, such
+as a dropped network call, to have it retried. Activities can be retried and can overlap, so make
+each method safe to call more than once.
 
-#### Example
+Make Claude Code stop when the Worker that started it stops, such as when its connection drops.
+Otherwise it keeps running, spending tokens and running tools, and can write to the session after
+the user resumes it.
 
-`CliFiles` and `follow_lines` make this easier. `CliFiles` gives the `sh` commands that start, feed, and stop Claude Code,
-with its output in files. You run the commands with your host's exec, and read the files with
-its file API. `subprocess_activities()` uses the same commands on the Worker.
+`close` stops Claude Code and everything it started. Whether it also deletes the host is up to you:
+a connector that creates its own sandbox per launch can delete it there, while one that runs Claude
+Code on compute something else owns, such as an orchestrator's, stops only the process and leaves
+deleting the compute to its owner.
 
-```python
-from collections.abc import AsyncIterator, Callable
-
-from temporalio import activity
-from temporalio.claude_agent_sdk import (
-    CliFiles,
-    LaunchRequest,
-    StdinWrite,
-    StopRequest,
-    WatchRequest,
-    follow_lines,
-    watch_output,
-)
-
-
-@activity.defn
-async def launch_remote(request: LaunchRequest) -> str:
-    host = await hosts.get_or_create(request.session_id)
-    files = CliFiles("/tmp", request.session_id)
-    await host.exec(files.launch_command("claude", request.args), env=request.env)
-    return host.id
-
-
-@activity.defn
-async def write_remote(request: StdinWrite) -> None:
-    host = await hosts.get(request.handle)
-    files = CliFiles("/tmp", request.session_id)
-    await host.exec(files.write_stdin_command(request.number), stdin=request.text)
-
-
-@activity.defn
-async def watch_remote(request: WatchRequest) -> None:
-    host = await hosts.get(request.handle)
-    files = CliFiles("/tmp", request.session_id)
-
-    async def running() -> bool:
-        return not await host.exists(files.exit)
-
-    def follow(path: str) -> Callable[[int], AsyncIterator[bytes]]:
-        return lambda offset: follow_lines(
-            lambda at: host.read(path, at), running, offset, poll_interval=1
-        )
-
-    await watch_output(
-        request.session_id,
-        stdout=follow(files.stdout),
-        exit_status=lambda: host.read_exit_status(files.exit),
-        stderr=follow(files.stderr),
-        stream_topic=request.stream_topic,
-        signal_stderr=request.signal_stderr,
-    )
-
-
-@activity.defn
-async def stop_remote(request: StopRequest) -> None:
-    if request.handle is not None:  # None if launch never finished
-        host = await hosts.get(request.handle)
-        await host.exec(CliFiles("/tmp", request.session_id).stop_command())
-```
-
-Run `launch_command` in a process group of its own, as most exec APIs do, so `stop_command` stops
-everything Claude Code started. `follow_lines` turns reads of a growing file into the lines
-`watch_output` sends. Here `running` checks only the `exit` file. To also notice when Claude Code
-is lost, such as when its host restarts, run `status_command` now and then.
-
-#### Wiring It Up
-
-Group the Activities, then pass them to the transport in the Workflow and to the plugin on the
-Worker:
+If the launch is cancelled while `connect` runs, the plugin waits for it and closes the process it
+returns, since the Workflow never gets a handle to close it. A launch can also be retried on another
+Worker, such as when the first Worker went away after starting Claude Code. To find what the first
+attempt created, name it after the launch, from `activity.info()`'s `workflow_run_id` and
+`activity_id`, and reuse it if it exists.
 
 ```python
-from temporalio.claude_agent_sdk import TemporalTransport, TransportActivities
+from temporalio.claude_agent_sdk import ClaudeCodeProcess, ConnectActivityInput
 
-REMOTE_ACTIVITIES = TransportActivities(
-    launch=launch_remote,
-    write_stdin=write_remote,
-    watch_output=watch_remote,
-    stop=stop_remote,
-)
 
-# In the Workflow
-transport = TemporalTransport(options, REMOTE_ACTIVITIES)
-async with ClaudeSDKClient(options=options, transport=transport) as client:
-    ...
+class RemoteConnector:
+    async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
+        box = await hosts.create()
+        process = await box.start([request.cli_path or "claude", *request.args], env=request.env, cwd=request.cwd)
+        return RemoteConnection(box, process)
+
 
 # On the Worker
-ClaudeAgentSDKPlugin(activities=REMOTE_ACTIVITIES)
+ClaudeAgentSDKPlugin(connector=RemoteConnector())
 ```
+
+Paths in `ClaudeAgentOptions`, such as `cwd` and plugin directories, are on Claude Code's host,
+as they are for the Claude Agent SDK. Bake the files into its image or mount them, or copy them
+there in `connect`; getting them onto the host is the connector's job, not the transport's. That
+includes plugin directories with their scripts and references. Pass `settings` as a JSON string,
+not a file path.
+
+### When Claude Code Stops
+
+As in the Claude Agent SDK, the transport raises when Claude Code stops: `ProcessError` if it
+exited with an error, and `CLIConnectionError` if it's gone, such as when its Worker went away.
+The transport never starts another Claude Code by itself.
+
+To continue the conversation, choose the session ID in the Workflow, and start a new client with
+`options.resume` set to it. With `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, the new Claude Code
+re-runs the turn that was cut off, so the new client only reads its reply:
+
+```python
+import dataclasses
+
+from claude_agent_sdk import CLIConnectionError
+
+session_id = str(workflow.uuid4())
+options = ClaudeAgentOptions(
+    session_id=session_id, env={"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1"}
+)
+while True:
+    try:
+        async with ClaudeSDKClient(options=options, transport=TemporalTransport(options)) as client:
+            if options.resume is None:
+                await client.query(prompt)
+            async for message in client.receive_response():
+                ...
+        break
+    except CLIConnectionError:
+        options = dataclasses.replace(options, session_id=None, resume=session_id)
+```
+
+`workflow.uuid4()` is the same on replay, and the session has its ID before Claude Code writes
+anything, so the Workflow can resume it even mid-turn. The new Claude Code reads the session from
+its config directory, so it must run where that directory is, such as on a volume every Worker
+mounts.
 
 ### Secrets
 
@@ -391,7 +369,7 @@ async for item in stream.subscribe(["progress"], result_type=str):
     print(item.data)
 ```
 
-Each message Claude Code writes reaches the Workflow as one Signal, as soon as it's written.
+Claude Code's messages reach the Workflow as soon as they're written, in the results of the transport's read Activities.
 
 ### Token-by-Token Output
 
@@ -424,8 +402,7 @@ class StreamingWorkflow:
         return ""
 ```
 
-Callers subscribe to `events` as above; each item's data is a `stream_event` message. A custom
-transport takes `stream` the same way. If a Worker fails, a caller may see a few events again. `include_partial_messages` and `stream` go together:
+Callers subscribe to `events` as above; each item's data is a `stream_event` message. `include_partial_messages` and `stream` go together:
 passing one without the other raises `ValueError`.
 
 ## Hardening
@@ -443,5 +420,5 @@ processes they start.
 
 Claude Code can do anything the Worker's user can on its host. For stronger isolation, run Claude
 Code in a separate container, VM, or remote environment. Use a
-[custom transport](#custom-transport) whose Activities communicate with that environment instead of
-launching Claude Code on the Worker.
+[custom connector](#custom-connector) that reaches that environment instead of launching Claude
+Code on the Worker.

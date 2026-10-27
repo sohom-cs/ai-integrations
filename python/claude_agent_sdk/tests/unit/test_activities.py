@@ -1,104 +1,271 @@
-"""The Activities that run the CLI, run as ActivityEnvironment runs them, with a shell script as the CLI."""
+"""The plugin's Activities, run as ActivityEnvironment runs them, with a shell script as the CLI."""
 
 from __future__ import annotations
 
 import asyncio
-import subprocess
+import json
 import sys
-import uuid
 from pathlib import Path
-from typing import Any
 
 import pytest
-
-from temporalio.claude_agent_sdk import LaunchRequest, StdinWrite
-from temporalio.claude_agent_sdk._subprocess._activities import (
-    launch,
-    write_stdin,
+from claude_agent_sdk import (
+    ClaudeSDKError,
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    CLINotFoundError,
+    ProcessError,
 )
-from temporalio.exceptions import ApplicationError
+
+from temporalio.claude_agent_sdk import (
+    ClaudeCodeProcess,
+    ConnectActivityInput,
+    SubprocessConnector,
+)
+from temporalio.claude_agent_sdk._activities import ConnectionActivities
+from temporalio.claude_agent_sdk._errors import activity_error, sdk_error
+from temporalio.claude_agent_sdk._types import (
+    CloseActivityInput,
+    EndInputActivityInput,
+    Output,
+    ReadActivityInput,
+    ReadResult,
+    WriteActivityInput,
+)
+from temporalio.exceptions import ActivityError, ApplicationError, RetryState
+from temporalio.service import PayloadLimitsConfig
 from temporalio.testing import ActivityEnvironment
 from tests.helpers.harness import CLAUDE, LocalCli
-from tests.helpers.workflows import until
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32" or not CLAUDE.is_file(),
     reason="needs sh and the Claude Agent SDK's bundled Claude Code",
 )
 
+# The plugin's own task queue for this process.
+OWN_QUEUE = "claude-agent-sdk-own"
+
 
 @pytest.fixture
-def cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalCli:
-    return LocalCli(tmp_path, monkeypatch)
+def cli(tmp_path: Path) -> LocalCli:
+    return LocalCli(tmp_path)
 
 
-def started_cli(cli: LocalCli, script: str = "exec cat") -> LaunchRequest:
-    """The request to launch a CLI that runs ``script``, by default echoing its stdin."""
+@pytest.fixture
+def activities() -> ConnectionActivities:
+    return ConnectionActivities(SubprocessConnector(), OWN_QUEUE)
+
+
+def request(cli: LocalCli, script: str = "exec cat") -> ConnectActivityInput:
+    """The input to start a CLI that runs ``script``, by default echoing its stdin."""
     cli.set_cli(script)
-    return LaunchRequest(str(uuid.uuid4()), [], {}, str(cli.cli_path))
+    return ConnectActivityInput([], {}, cli_path=str(cli.cli_path))
 
 
-def running(text: str) -> list[str]:
-    """The processes whose arguments have ``text``."""
-    ps = subprocess.run(
-        ["ps", "-A", "-o", "args="], capture_output=True, text=True, check=True
+async def test_a_read_returns_the_next_output_until_claude_code_exits(
+    cli: LocalCli, activities: ConnectionActivities
+) -> None:
+    run = ActivityEnvironment().run
+    launch = request(cli)
+
+    launched = await run(activities.connect, launch)
+    # A retried launch starts nothing more.
+    assert await run(activities.connect, launch) == launched
+    # Only this Worker can reach the subprocess, so the rest goes to its own queue.
+    assert launched.task_queue == OWN_QUEUE
+    handle = launched.handle
+    await run(activities.write, WriteActivityInput(handle, '{"n": 1}\n'))
+    assert await run(activities.read, ReadActivityInput(handle)) == ReadResult(
+        [{"n": 1}]
     )
-    return [line for line in ps.stdout.splitlines() if text in line]
+    await run(activities.write, WriteActivityInput(handle, '{"n": 2}\n'))
+    assert await run(activities.read, ReadActivityInput(handle)) == ReadResult(
+        [{"n": 2}]
+    )
 
+    await run(activities.end_input, EndInputActivityInput(handle))
 
-async def test_a_retried_launch_or_write_starts_and_writes_once(cli: LocalCli) -> None:
-    activities = ActivityEnvironment()
-    request = started_cli(cli)
-
-    host = await activities.run(launch, request)
-    assert await activities.run(launch, request) == host
-    first = '{"n": 1}\n{"n": 2}\n'
-    write = StdinWrite(request.session_id, host, 1, first)
-    await activities.run(write_stdin, write)
-    await activities.run(write_stdin, write)
-    process = cli.session()
-    stdin = Path(process.stdin)
-    assert (stdin / "1.jsonl").read_text() == first
-    # Attempts that run together, as a retry can with an earlier attempt that
-    # outlived it, write the file whole.
-    write = StdinWrite(request.session_id, host, 2, '{"n": 3}\n')
-    await asyncio.gather(*(activities.run(write_stdin, write) for _ in range(5)))
-    assert sorted(path.name for path in stdin.iterdir()) == [
-        "1.jsonl",
-        "2.jsonl",
-    ]
-    assert (stdin / "2.jsonl").read_text() == write.text
-
-    # The CLI echoes its stdin: each line, once, in the order of the files.
-    await until(lambda: len(Path(process.stdout).read_text().splitlines()) >= 3)
-    await asyncio.sleep(0.5)
-    lines = Path(process.stdout).read_text().splitlines()
-    assert lines == ['{"n": 1}', '{"n": 2}', '{"n": 3}']
+    assert await run(activities.read, ReadActivityInput(handle)) == ReadResult()
+    await run(activities.close, CloseActivityInput(handle))
+    # A retried close, such as after its result was lost, does nothing.
+    await run(activities.close, CloseActivityInput(handle))
     assert len(cli.cli_pids()) == 1
-    # A retry after the CLI exited leaves the exit to watching its output.
-    await cli.kill_cli_and_wait()
-    assert await activities.run(launch, request) == host
-    # A write after the CLI exited is no error: watching its output finds the exit.
-    await activities.run(write_stdin, StdinWrite(request.session_id, host, 3, "{}\n"))
-    # Nothing that fed the CLI's stdin is left running.
-    await until(lambda: not running(process.dir))
+    assert cli.running() == []
+
+
+async def test_a_read_returns_at_most_about_a_mebibyte(
+    cli: LocalCli, activities: ConnectionActivities
+) -> None:
+    """To stay under Temporal's payload limit: the next read returns the rest."""
+    line = """printf '{"x": "'; head -c 600000 /dev/zero | tr '\\0' x; echo '"}'"""
+    launched = await ActivityEnvironment().run(
+        activities.connect, request(cli, f"{line}; {line}; {line}")
+    )
+
+    counts: list[int] = []
+    while True:
+        read = ReadActivityInput(launched.handle)
+        result = await ActivityEnvironment().run(activities.read, read)
+        counts.append(len(result.output))
+        if not result.output:
+            break
+
+    assert counts == [1, 1, 1, 0]
+    await ActivityEnvironment().run(
+        activities.close, CloseActivityInput(launched.handle)
+    )
+
+
+async def test_a_read_includes_stderr_in_the_payload_limit(cli: LocalCli) -> None:
+    line = "head -c 600000 /dev/zero | tr '\\0' x >&2; echo >&2"
+    process = await SubprocessConnector().connect(
+        request(cli, f"{line}; {line}; echo '{{\"n\": 1}}'")
+    )
+
+    batches: list[list[Output]] = []
+    while output := await process.read():
+        batches.append(output)
+
+    limit = PayloadLimitsConfig().payloads_warn_size
+    assert all(
+        len(json.dumps(batch).encode()) <= limit or len(batch) == 1 for batch in batches
+    )
+    assert [item for batch in batches for item in batch][-1] == {"n": 1}
+    await process.close()
+
+
+async def test_a_read_returns_all_the_output_already_written(cli: LocalCli) -> None:
+    process = await SubprocessConnector().connect(
+        request(cli, """printf '{"n": 1}\\n{"n": 2}\\n'; sleep 1""")
+    )
+
+    assert await process.read() == [{"n": 1}, {"n": 2}]
+    await process.close()
+
+
+async def test_a_cancelled_read_leaves_the_next_output_to_its_retry(
+    cli: LocalCli,
+) -> None:
+    """Such as an attempt that timed out, cancelled while its retry runs."""
+    process = await SubprocessConnector().connect(request(cli))
+
+    attempt = asyncio.create_task(process.read())
+    await asyncio.sleep(0.1)
+    attempt.cancel()
+    await process.write('{"n": 1}\n')
+
+    assert await process.read() == [{"n": 1}]
+    await process.close()
+
+
+async def test_a_read_returns_stderr_before_the_output(cli: LocalCli) -> None:
+    process = await SubprocessConnector().connect(
+        request(cli, """echo warning >&2; sleep 0.5; echo '{"n": 1}'""")
+    )
+
+    assert await process.read() == ["warning", {"n": 1}]
+    assert await process.read() == []
+    await process.close()
+
+
+async def test_a_nonzero_exit_fails_the_read_for_good(
+    cli: LocalCli, activities: ConnectionActivities
+) -> None:
+    run = ActivityEnvironment().run
+    launched = await run(activities.connect, request(cli, "exit 3"))
+
+    with pytest.raises(ApplicationError) as raised:
+        await run(activities.read, ReadActivityInput(launched.handle))
+
+    assert raised.value.type == "ProcessError"
+    assert raised.value.non_retryable
+    assert raised.value.details[0] == 3
+    await run(activities.close, CloseActivityInput(launched.handle))
 
 
 @pytest.mark.parametrize(
-    ("activity", "request_", "reason"),
+    ("connect", "error", "reason"),
     [
-        (launch, LaunchRequest("s", [], {}, cwd="/missing"), "Working directory"),
-        (launch, LaunchRequest("s", [], {}, user="someone"), "options.user"),
-        # Claude Code's files are on its host, so a retry elsewhere can't reach them.
-        (write_stdin, StdinWrite("s", "elsewhere", 1, "{}\n"), "task_queue"),
+        (
+            ConnectActivityInput([], {}, cwd="/missing"),
+            "CLIConnectionError",
+            "Working directory",
+        ),
+        (
+            ConnectActivityInput([], {}, cli_path="/missing/claude"),
+            "CLINotFoundError",
+            "/missing/claude",
+        ),
     ],
 )
 async def test_what_no_retry_can_fix_fails_for_good(
-    activity: Any, request_: Any, reason: str
+    activities: ConnectionActivities,
+    connect: ConnectActivityInput,
+    error: str,
+    reason: str,
 ) -> None:
     with pytest.raises(ApplicationError) as raised:
-        await ActivityEnvironment().run(activity, request_)
+        await ActivityEnvironment().run(activities.connect, connect)
 
-    assert raised.value.type == "CLIConnectionError"
+    assert raised.value.type == error
     assert raised.value.non_retryable
     assert reason in raised.value.message
+
+
+async def test_a_launch_cancelled_while_starting_closes_what_it_started(
+    cli: LocalCli,
+) -> None:
+    """Such as a Workflow cancelled during the launch, which never gets the handle to close it."""
+    starting = asyncio.Event()
+    started: list[ClaudeCodeProcess] = []
+
+    class SlowConnector:
+        async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
+            starting.set()
+            await asyncio.sleep(0.5)
+            process = await SubprocessConnector().connect(request)
+            started.append(process)
+            return process
+
+    env = ActivityEnvironment()
+    activities = ConnectionActivities(SlowConnector(), OWN_QUEUE)
+    launch = asyncio.create_task(env.run(activities.connect, request(cli)))
+    await starting.wait()
+    env.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await launch
+
+    [process] = started
+    with pytest.raises(CLIConnectionError):
+        await process.write("{}\n")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProcessError("Command failed", exit_code=3, stderr="bad flag"),
+        CLINotFoundError("Claude Code not found"),
+        CLIJSONDecodeError('{"x', ValueError("Unterminated string")),
+        CLIConnectionError("Claude Code is not running"),
+    ],
+)
+def test_the_transport_raises_the_error_the_activity_failed_with(
+    error: ClaudeSDKError,
+) -> None:
+    failed = ActivityError(
+        "Activity failed",
+        scheduled_event_id=1,
+        started_event_id=2,
+        identity="worker",
+        activity_type="claude-agent-sdk-read",
+        activity_id="1",
+        retry_state=RetryState.NON_RETRYABLE_FAILURE,
+    )
+    failed.__cause__ = activity_error(error)
+
+    raised = sdk_error(failed)
+
+    assert type(raised) is type(error)
+    assert str(raised) == str(error)
+    # Such as ProcessError's exit_code, and CLIJSONDecodeError's original_error.
+    assert repr(vars(raised)) == repr(vars(error))

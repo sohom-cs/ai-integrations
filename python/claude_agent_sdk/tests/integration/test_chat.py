@@ -4,25 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import sys
-from collections.abc import Awaitable, Callable
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from temporalio import activity
 from temporalio.api.enums.v1 import EventType
-from temporalio.claude_agent_sdk._subprocess._activities import CLOSE, WATCH_OUTPUT
-from temporalio.client import WorkflowFailureError
+from temporalio.claude_agent_sdk import ClaudeAgentSDKPlugin
+from temporalio.client import WorkflowFailureError, WorkflowHandle
 from temporalio.exceptions import ApplicationError, CancelledError
-from temporalio.worker import (
-    ActivityInboundInterceptor,
-    ExecuteActivityInput,
-    Interceptor,
-)
+from temporalio.worker import Replayer, Worker
 from tests.helpers.harness import (
     ANSWERS,
     CLAUDE,
@@ -37,6 +31,7 @@ from tests.helpers.workflows import (
     CliRunWorkflow,
     Hook,
     OneShotWorkflow,
+    ResumingWorkflow,
     bash,
     tool_use,
     until,
@@ -77,27 +72,6 @@ def notes(harness: Harness) -> Path:
     return harness.workspace / "notes.txt"
 
 
-def intercept(
-    harness: Harness,
-    around: Callable[
-        [ExecuteActivityInput, Callable[[], Awaitable[Any]]], Awaitable[Any]
-    ],
-) -> None:
-    """Run each Activity of the harness's Workers through ``around``, which runs it with its second argument."""
-
-    class Inbound(ActivityInboundInterceptor):
-        async def execute_activity(self, input: ExecuteActivityInput) -> Any:
-            return await around(input, lambda: self.next.execute_activity(input))
-
-    class Intercept(Interceptor):
-        def intercept_activity(
-            self, next: ActivityInboundInterceptor
-        ) -> ActivityInboundInterceptor:
-            return Inbound(next)
-
-    harness.interceptors.append(Intercept())
-
-
 async def test_each_prompt_is_a_turn_of_one_conversation(harness: Harness) -> None:
     answers = {**ANSWERS, "bye": "Bye."}
 
@@ -124,34 +98,87 @@ async def test_a_denied_tool_does_not_run_and_the_model_reads_why(
     assert not notes(harness).exists()
 
 
-async def test_a_lost_watch_of_the_output_goes_on_where_it_was(
+async def chat_until_a_worker_is_lost(
+    harness: Harness, chat: Chat, plugin: ClaudeAgentSDKPlugin
+) -> WorkflowHandle[Any, Any]:
+    """Start the chat on a Worker with ``plugin``, and shut that Worker down once a tool call waits for a person."""
+    task_queue = str(uuid.uuid4())
+    async with Worker(
+        harness.client,
+        task_queue=task_queue,
+        workflows=[ChatWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await harness.client.start_workflow(
+            ChatWorkflow.run, chat, id=task_queue, task_queue=task_queue
+        )
+        while not await handle.query(ChatWorkflow.pending_approvals):
+            await asyncio.sleep(0.05)
+    return handle
+
+
+# The next Activity waits 30 seconds for the lost Worker, and so does stopping Claude Code.
+@pytest.mark.timeout(150)
+async def test_a_workflow_whose_worker_died_fails_with_a_way_to_resume(
     harness: Harness,
 ) -> None:
-    lost: list[str] = []
+    harness.answers = ANSWERS
+    chat = Chat(["write it"], str(harness.cli_path))
+    handle = await chat_until_a_worker_is_lost(harness, chat, ClaudeAgentSDKPlugin())
 
-    async def lose_the_first_watch(
-        _watch: ExecuteActivityInput, execute: Callable[[], Awaitable[Any]]
-    ) -> Any:
-        """Fail the first watch of the CLI's output, as if its Worker were lost, once the API is asked."""
-        if activity.info().activity_type != WATCH_OUTPUT or lost:
-            return await execute()
-        lost.append("watch")
-        watching = asyncio.ensure_future(execute())
-        await until(lambda: harness.asked)
-        await asyncio.sleep(1.5)  # Past a flush of the output.
-        watching.cancel()
-        await asyncio.wait([watching])
-        raise RuntimeError("The Worker was lost")
+    plugin = ClaudeAgentSDKPlugin()
+    async with Worker(
+        harness.client,
+        task_queue=handle.id,
+        workflows=[ChatWorkflow],
+        plugins=[plugin],
+    ):
+        with pytest.raises(WorkflowFailureError) as raised:
+            await handle.result()
+    error = raised.value.cause
+    assert isinstance(error, ApplicationError)
+    assert error.type == "CLIConnectionError"
+    assert "options.resume" in error.message
+    replayer = Replayer(workflows=[ChatWorkflow], plugins=[plugin])
+    await replayer.replay_workflow(await handle.fetch_history())
 
-    intercept(harness, lose_the_first_watch)
 
-    messages = await harness.run(ANSWERS, ["write it"], decide_after=3)
+# The next Activity waits 30 seconds for the lost Worker, and so does stopping Claude Code.
+@pytest.mark.timeout(150)
+async def test_a_workflow_resumes_the_session_its_lost_worker_cut_off_mid_turn(
+    harness: Harness,
+) -> None:
+    harness.answers = ANSWERS
+    task_queue = str(uuid.uuid4())
+    args = ["write it", str(harness.cli_path)]
+    async with Worker(
+        harness.client,
+        task_queue=task_queue,
+        workflows=[ResumingWorkflow],
+        plugins=[ClaudeAgentSDKPlugin()],
+    ):
+        handle = await harness.client.start_workflow(
+            ResumingWorkflow.run, args=args, id=task_queue, task_queue=task_queue
+        )
+        while not await handle.query(ResumingWorkflow.pending_approvals):
+            await asyncio.sleep(0.05)
 
-    assert lost
-    assert [m for m in messages if m[0] != "Ask"] == WRITE_IT_MESSAGES
-    # Nothing started again.
-    assert harness.asked == ["write it", "tool_result:toolu_1"]
-    assert len(harness.cli_pids()) == 1
+    async with Worker(
+        harness.client,
+        task_queue=task_queue,
+        workflows=[ResumingWorkflow],
+        plugins=[ClaudeAgentSDKPlugin()],
+    ):
+        # The resumed Claude Code re-runs the turn, so it asks about the tool call again.
+        while await handle.query(ResumingWorkflow.launch_count) < 2 or not (
+            await handle.query(ResumingWorkflow.pending_approvals)
+        ):
+            await asyncio.sleep(0.1)
+        await handle.execute_update(ResumingWorkflow.decide, "toolu_1")
+        assert await handle.result() == "Wrote it."
+
+    assert notes(harness).read_text() == "hi\n"
+    assert harness.asked.count("write it") == 2
 
 
 async def test_a_cli_that_cannot_run_fails_the_workflow(harness: Harness) -> None:
@@ -162,26 +189,23 @@ async def test_a_cli_that_cannot_run_fails_the_workflow(harness: Harness) -> Non
 
     error = raised.value.cause
     assert isinstance(error, ApplicationError)
-    assert error.type == "ProcessError"
-    assert "bad flag" in error.message
-    # Its files are removed.
-    assert harness.sessions() == []
+    # As in the Claude Agent SDK, writing the prompt can see the exit first.
+    assert error.type in ("ProcessError", "CLIConnectionError")
+    assert "exit code: 2" in error.message
+    assert harness.running() == []
 
 
-async def test_stderr_and_a_settings_file_reach_claude_code_as_in_the_sdk(
+async def test_stderr_and_settings_reach_claude_code_as_in_the_sdk(
     harness: Harness,
 ) -> None:
-    """options.stderr gets each line: without trailing whitespace, blank lines skipped, and the last one even without a newline. options.sandbox merges into a settings file, which an Activity reads."""
-    settings = harness.root / "settings.json"
-    settings.write_text(json.dumps({"permissions": {"deny": ["Bash"]}}))
+    """options.stderr gets each line: without trailing whitespace, blank lines skipped, and the last one even without a newline. options.sandbox merges into options.settings."""
+    settings = json.dumps({"permissions": {"deny": ["Bash"]}})
     harness.set_cli(
         f'printf "%s\\n" "$@" > "{harness.root}/args"; '
         "echo one >&2; echo >&2; sleep 0.5; printf 'two  ' >&2"
     )
 
-    async with harness.start(
-        CliRunWorkflow, str(harness.cli_path), str(settings)
-    ) as handle:
+    async with harness.start(CliRunWorkflow, str(harness.cli_path), settings) as handle:
         lines = await handle.result()
 
     assert lines == ["one", "two"]
@@ -293,7 +317,7 @@ async def test_cancelling_the_workflow_while_a_person_decides_stops_claude_code(
         await until(lambda: harness.asked)
         while not await handle.query(ChatWorkflow.pending_approvals):
             await asyncio.sleep(0.05)
-        [pid] = harness.cli_pids()
+        assert len(harness.running()) == 1
 
         await handle.cancel()
 
@@ -306,15 +330,14 @@ async def test_cancelling_the_workflow_while_a_person_decides_stops_claude_code(
         history.events[-1].event_type
         == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED
     )
-    closes = [
+    stops = [
         event
         for event in history.events
-        if event.activity_task_scheduled_event_attributes.activity_type.name == CLOSE
+        if event.activity_task_scheduled_event_attributes.activity_type.name
+        == "claude-agent-sdk-close"
     ]
-    assert len(closes) == 1
-    assert harness.sessions() == []
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert len(stops) == 1
+    assert harness.running() == []
     assert not notes(harness).exists()
 
 
@@ -419,8 +442,8 @@ async def test_the_sdks_query_function_ends_once_claude_code_is_done(
         messages = await handle.result()
 
     assert results(messages) == [["Started."], ["Finished."]]
-    # Ending the input stopped the CLI, and its files are removed.
-    assert harness.sessions() == []
+    # Ending the input stopped the CLI.
+    assert harness.running() == []
 
 
 async def test_a_turn_claude_code_starts_on_its_own_while_idle_is_watched(

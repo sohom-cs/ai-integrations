@@ -7,7 +7,6 @@ import contextlib
 import json
 import os
 import signal
-import tempfile
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -18,10 +17,7 @@ from typing import Any
 import claude_agent_sdk as sdk
 import pytest
 
-from temporalio.claude_agent_sdk import (
-    ClaudeAgentSDKPlugin,
-)
-from temporalio.claude_agent_sdk._cli_files import CliFiles
+from temporalio.claude_agent_sdk import ClaudeAgentSDKPlugin
 from temporalio.client import Client, WorkflowHandle
 from temporalio.worker import Interceptor, Replayer
 from tests.helpers.example import TASK_QUEUE, AgentWorkflow, ToolApproval, create_worker
@@ -30,70 +26,54 @@ from tests.helpers.workflows import (
     ChatWorkflow,
     bash,
     start_workflow,
-    until,
 )
 
 CLAUDE = Path(sdk.__file__).parent / "_bundled" / "claude"
-# Each CLI's files are in a directory of the temp dir named this and its session ID.
-SESSION_DIR = "temporal-claude-code-"
 
 
 class LocalCli:
-    """The CLIs the Activities run on this host, with their files under ``root``.
+    """The CLIs the Activities run on this host.
 
-    Points this process's temp dir, where the Activities keep each CLI's files,
-    at ``root/tmp`` until the test ends. ``cli_path`` runs the bundled Claude
-    Code, or what :meth:`set_cli` makes it run.
+    ``cli_path`` runs the bundled Claude Code, or what :meth:`set_cli` makes it run.
     """
 
-    def __init__(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(self, root: Path) -> None:
         self.root = root
         self.cli_path = root / "bin" / "claude"
         self.cli_path.parent.mkdir()
-        (root / "tmp").mkdir()
-        monkeypatch.setattr(tempfile, "tempdir", str(root / "tmp"))
         self.set_cli(f'exec "{CLAUDE}" "$@"')
 
     def set_cli(self, script: str) -> None:
         """Make the CLI run ``script``, recording each pid, but answer the version check as Claude Code."""
-        pid = self.root / "cli.pid"
         self.cli_path.write_text(
             "#!/bin/sh\n"
             f'[ "$1" = -v ] && exec "{CLAUDE}" -v\n'
-            f'echo $$ > "{pid}"; echo $$ >> "{pid}s"\n'
+            f'echo $$ >> "{self.root / "cli.pids"}"\n'
             f"{script}\n"
         )
         self.cli_path.chmod(0o755)
-
-    def sessions(self) -> list[CliFiles]:
-        """Each CLI whose files are left."""
-        temp = tempfile.gettempdir()
-        dirs = sorted(Path(temp).glob(f"{SESSION_DIR}*"))
-        return [CliFiles(temp, d.name.removeprefix(SESSION_DIR)) for d in dirs]
-
-    def session(self) -> CliFiles:
-        """The one CLI whose files are left."""
-        [cli] = self.sessions()
-        return cli
 
     def cli_pids(self) -> list[int]:
         """Each CLI started so far."""
         pids = self.root / "cli.pids"
         return [int(pid) for pid in pids.read_text().split()] if pids.exists() else []
 
-    async def kill_cli_and_wait(self) -> None:
-        """Kill the CLI started last, and wait until its exit is recorded."""
-        # Launching returns before the CLI's shell has started.
-        await until((self.root / "cli.pid").exists)
-        os.kill(int((self.root / "cli.pid").read_text()), signal.SIGKILL)
-        await until(lambda: Path(self.session().exit).exists())
+    def running(self) -> list[int]:
+        """Each CLI started so far that is still running."""
+        return [pid for pid in self.cli_pids() if _running(pid)]
 
     def kill_processes(self) -> None:
-        """Kill everything a CLI whose files are left started."""
-        for cli in self.sessions():
-            with contextlib.suppress(OSError):
-                _, group, _ = Path(cli.pid).read_text().split()
-                os.killpg(int(group), signal.SIGKILL)
+        """Kill each CLI started so far."""
+        for pid in self.running():
+            os.kill(pid, signal.SIGKILL)
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 # Answers for "write it", which writes notes.txt in the workspace, and "read it".
@@ -166,7 +146,7 @@ class Harness(LocalCli):
     def __init__(
         self, client: Client, root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        super().__init__(root, monkeypatch)
+        super().__init__(root)
         self.client = client
         self.answers: dict[str, Any] = {}
         self.asked: list[str] = []

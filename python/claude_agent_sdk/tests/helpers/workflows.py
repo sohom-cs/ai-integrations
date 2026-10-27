@@ -182,10 +182,71 @@ class OneShotWorkflow:
 
 
 @workflow.defn
+class ResumingWorkflow:
+    """Sends the prompt, asks a person about each tool call, and resumes the session if Claude Code goes away, as the README shows."""
+
+    def __init__(self) -> None:
+        self.pending: list[str] = []
+        self.decisions: dict[str, bool] = {}
+        self.launches = 0
+
+    @workflow.run
+    async def run(self, prompt: str, cli_path: str) -> str:
+        session_id = str(workflow.uuid4())
+        options = sdk.ClaudeAgentOptions(
+            cli_path=cli_path,
+            can_use_tool=self.approve,
+            permission_mode="default",
+            session_id=session_id,
+            env={"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1"},
+        )
+        result = ""
+        while True:
+            try:
+                self.launches += 1
+                transport = TemporalTransport(options)
+                async with sdk.ClaudeSDKClient(options, transport=transport) as client:
+                    if options.resume is None:
+                        await client.query(prompt)
+                    async for message in client.receive_response():
+                        if isinstance(message, sdk.ResultMessage):
+                            result = message.result or ""
+                return result
+            except sdk.CLIConnectionError:
+                options = dataclasses.replace(
+                    options, session_id=None, resume=session_id
+                )
+
+    async def approve(
+        self, tool_name: str, tool_input: dict[str, Any], context: Any
+    ) -> sdk.PermissionResult:
+        del tool_name, tool_input
+        tool_use_id = context.tool_use_id or ""
+        self.pending.append(tool_use_id)
+        try:
+            await workflow.wait_condition(lambda: tool_use_id in self.decisions)
+        finally:
+            self.pending.remove(tool_use_id)
+        return sdk.PermissionResultAllow()
+
+    @workflow.query
+    def pending_approvals(self) -> list[str]:
+        return self.pending
+
+    @workflow.query
+    def launch_count(self) -> int:
+        return self.launches
+
+    @workflow.update
+    def decide(self, tool_use_id: str) -> None:
+        self.decisions[tool_use_id] = True
+
+
+@workflow.defn
 class CliRunWorkflow:
     """Runs the CLI at ``cli_path`` to its end, and returns the lines ``options.stderr`` got.
 
-    With ``settings``, a file path, the sandbox is enabled too.
+    With ``settings``, a JSON string, the sandbox is enabled too.
     """
 
     @workflow.run
@@ -202,6 +263,7 @@ class CliRunWorkflow:
         await transport.end_input()
         async for _ in transport.read_messages():
             pass
+        await transport.close()
         return lines
 
 
