@@ -511,6 +511,18 @@ export async function statefulMcpWorkflow(prompt: string): Promise<string> {
 
 Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` type (exported as `DEDICATED_WORKER_FAILURE_TYPE`).
 
+### MCP tool filters
+
+A static `toolFilter` on the server your factory returns, such as `createMCPToolStaticFilter({ blocked: ['delete_file'] })`, applies in the list-tools Activity. The agent never sees a blocked tool.
+
+A callable filter gets the agent and the run context, which exist only in the Workflow. Pass it as the `toolFilter` option of `statelessMcpServer()` or `statefulMcpServer()` instead; it runs in Workflow code and must be deterministic. The Worker skips a callable filter on the factory's server and logs a warning.
+
+```ts
+const server = statelessMcpServer('files', {
+  toolFilter: async ({ agent }, tool) => tool.name !== 'delete_file' || agent.name === 'FileAdmin',
+});
+```
+
 ## Sandbox agents
 
 > **Experimental** — sandbox support is subject to change prior to General Availability.

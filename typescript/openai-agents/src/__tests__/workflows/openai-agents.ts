@@ -1,4 +1,4 @@
-import { Agent } from '@openai/agents-core';
+import { Agent, type MCPToolFilterContext } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -97,6 +97,28 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, prompt, { maxTurns: 5 });
   return result.finalOutput ?? '';
+}
+
+export async function mcpToolFilterWorkflow(stateful: boolean): Promise<string> {
+  // The factory's server blocks `danger_tool` with a static filter; this filter blocks `extra_tool`.
+  const toolFilter = async ({ agent }: MCPToolFilterContext, tool: { name: string }) =>
+    agent.name === 'McpToolFilterAgent' && tool.name !== 'extra_tool';
+  const server = stateful
+    ? statefulMcpServer('filterStateful', { toolFilter })
+    : statelessMcpServer('filterStateless', { toolFilter });
+  await server.connect();
+  try {
+    const agent = new Agent({
+      name: 'McpToolFilterAgent',
+      instructions: 'You have access to MCP tools.',
+      model: 'gpt-4o-mini',
+      mcpServers: [server],
+    });
+    const result = await new TemporalOpenAIRunner().run(agent, 'Hello');
+    return result.finalOutput ?? '';
+  } finally {
+    await server.close();
+  }
 }
 
 export async function summaryOverrideStringWorkflow(prompt: string): Promise<string> {

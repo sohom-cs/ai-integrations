@@ -1,4 +1,4 @@
-import type { MCPServer } from '@openai/agents-core';
+import type { MCPServer, MCPToolFilterCallable, MCPToolFilterStatic } from '@openai/agents-core';
 import type { Duration, RetryPolicy } from '@temporalio/common';
 import { proxyActivities } from '@temporalio/workflow';
 import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
@@ -10,6 +10,11 @@ export interface StatelessMcpServerOptions {
   taskQueue?: string;
   retryPolicy?: RetryPolicy;
   factoryArgument?: unknown;
+  /**
+   * Tool filter the agent applies in the Workflow, as for a native MCP server. A callable filter
+   * gets the agent and the run context, and must be deterministic.
+   */
+  toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
 }
 
 export function statelessMcpServer(name: string, options?: StatelessMcpServerOptions): MCPServer {
@@ -30,6 +35,7 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
 
   return {
     cacheToolsList: shouldCache,
+    toolFilter: options?.toolFilter,
     get name() {
       return name;
     },

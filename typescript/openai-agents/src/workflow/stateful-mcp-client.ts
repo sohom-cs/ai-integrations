@@ -1,3 +1,4 @@
+import type { MCPToolFilterCallable, MCPToolFilterStatic } from '@openai/agents-core';
 import {
   ActivityFailure,
   ApplicationFailure,
@@ -45,6 +46,11 @@ export interface StatefulMcpServerOptions {
    * mid-run.
    */
   cacheToolsList?: boolean;
+  /**
+   * Tool filter the agent applies in the Workflow, as for a native MCP server. A callable filter
+   * gets the agent and the run context, and must be deterministic.
+   */
+  toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
 }
 
 const DEDICATED_WORKER_SCHEDULE_FAILURE_MESSAGE =
@@ -91,6 +97,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   private _sessionScope: CancellationScope | undefined;
   private _sessionPromise: Promise<void> | undefined;
   private _connected = false;
+  toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
 
   constructor(name: string, options?: StatefulMcpServerOptions) {
     this._name = `${name}${MCP_STATEFUL_SUFFIX}`;
@@ -107,6 +114,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     };
     this._factoryArgument = options?.factoryArgument;
     this._cacheToolsList = options?.cacheToolsList ?? true;
+    this.toolFilter = options?.toolFilter;
   }
 
   get name(): string {
