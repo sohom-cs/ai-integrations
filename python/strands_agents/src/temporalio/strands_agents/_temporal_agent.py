@@ -6,7 +6,6 @@ from strands import Agent
 from strands.hooks import BeforeModelCallEvent, HookCallback
 from strands.types.tools import AgentTool
 
-from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
@@ -14,22 +13,16 @@ from ._temporal_mcp_client import TemporalMCPClient
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
 
-# Runs that registered a duplicate MCP tool name before this check existed
-# replaced the earlier tool; they keep doing so on replay, and keep the old
-# removal rule and partial registration when Strands refuses a name.
-_REFUSE_DUPLICATE_TOOL_NAMES = "strands-refuse-duplicate-mcp-tool-names"
-
 
 @dataclass
 class _MCPListing:
-    """A provider's listing for this turn and the one it replaced.
+    """A provider's listing for this turn.
 
     The listing is kept here: another agent sharing the provider may list it
     again before this agent checks it.
     """
 
     provider: TemporalMCPClient
-    tools: list[AgentTool]
     new: dict[str, AgentTool]
 
 
@@ -152,8 +145,8 @@ class TemporalAgent(Agent):
                 return
             listings = [listing]
             # A name held by a provider that lists again later in this turn
-            # may be stale. In new runs, list those providers now, in the
-            # same order, and check the listings together.
+            # may be stale. List those providers now, in the same order, and
+            # check the listings together.
             later = [
                 other
                 for other in self._mcp_providers[
@@ -161,9 +154,7 @@ class TemporalAgent(Agent):
                 ]
                 if not self._cached(other)
             ]
-            if self._held_by(event, listing, later) and workflow.patched(
-                _REFUSE_DUPLICATE_TOOL_NAMES
-            ):
+            if self._held_by(event, listing, later):
                 try:
                     for other in later:
                         listings.append(await self._fetch_mcp_tools(other))
@@ -197,11 +188,8 @@ class TemporalAgent(Agent):
 
     @staticmethod
     async def _fetch_mcp_tools(provider: TemporalMCPClient) -> _MCPListing:
-        old = provider._tools
         await provider._refresh()
-        return _MCPListing(
-            provider, old, {tool.tool_name: tool for tool in provider._tools}
-        )
+        return _MCPListing(provider, {tool.tool_name: tool for tool in provider._tools})
 
     def _held_by(
         self,
@@ -247,13 +235,6 @@ class TemporalAgent(Agent):
                 for name in self._mcp_owned[provider]
                 if name not in new and mine(provider, name)
             }
-            # Earlier versions removed every name missing from the provider's
-            # new listing that its previous one had, whichever tool held it.
-            # Runs recorded then keep that rule.
-            removed = {tool.tool_name for tool in listing.tools} - set(new)
-            legacy = {name for name in removed if name in reg.registry}
-            if legacy != gone and not workflow.patched(_REFUSE_DUPLICATE_TOOL_NAMES):
-                gone = legacy
             drop |= gone
         # A name another tool holds, or that two listings share, is refused,
         # as Strands refuses it natively. Check before changing the registry.
@@ -268,7 +249,7 @@ class TemporalAgent(Agent):
                 ):
                     taken.append(name)
                 seen.add(name)
-        if taken and workflow.patched(_REFUSE_DUPLICATE_TOOL_NAMES):
+        if taken:
             refuse()
             raise ValueError(
                 f"Tool name '{taken[0]}' already exists. Cannot register tools "
@@ -290,16 +271,12 @@ class TemporalAgent(Agent):
                         reg.register_tool(tool)
         except ValueError:
             # Strands refused a name, e.g. one that differs from another
-            # tool's only by '-' or '_'. Undo the whole listing. Earlier
-            # versions kept the tools registered before the refused one.
-            if workflow.patched(_REFUSE_DUPLICATE_TOOL_NAMES):
-                reg.registry.clear()
-                reg.registry.update(registry)
-                reg.dynamic_tools.clear()
-                reg.dynamic_tools.update(dynamic_tools)
-                refuse()
-                raise
-            self._accept_mcp_tools(reg.registry, listings)
+            # tool's only by '-' or '_'. Undo the whole listing.
+            reg.registry.clear()
+            reg.registry.update(registry)
+            reg.dynamic_tools.clear()
+            reg.dynamic_tools.update(dynamic_tools)
+            refuse()
             raise
         self._accept_mcp_tools(reg.registry, listings)
 

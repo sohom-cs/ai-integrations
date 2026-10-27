@@ -414,7 +414,6 @@ async def test_mcp_duplicate_refused_again_after_caught(
     monkeypatch: pytest.MonkeyPatch, cache_tools: bool
 ):
     """Catching the duplicate-name error does not let the next turn take the name."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: True)
     a = TemporalMCPClient("a", cache_tools=cache_tools)
     c = TemporalMCPClient("c", cache_tools=cache_tools)
     agent = TemporalAgent(model="m", tools=[a, c])
@@ -431,32 +430,8 @@ async def test_mcp_duplicate_refused_again_after_caught(
         assert agent.tool_registry.registry["echo"]._server == "a"  # type: ignore[attr-defined]
 
 
-async def test_mcp_old_run_keeps_removing_a_dropped_duplicate(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """An old run removes `echo` when c stops listing it, as earlier versions did."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: False)
-    a = TemporalMCPClient("a")
-    c = TemporalMCPClient("c")
-    agent = TemporalAgent(model="m", tools=[a, c])
-    event = SimpleNamespace(agent=agent)
-    hook_a = agent._make_mcp_refresh_hook(a)
-    hook_c = agent._make_mcp_refresh_hook(c)
-    monkeypatch.setattr(a, "_refresh", _listing(a, "echo"))
-    monkeypatch.setattr(c, "_refresh", _listing(c, "echo"))
-    await _run_hook(hook_a, event)
-    await _run_hook(hook_c, event)
-
-    # c drops `echo`; the history's next model call then finds no `echo` tool.
-    monkeypatch.setattr(c, "_refresh", _listing(c))
-    await _run_hook(hook_a, event)
-    await _run_hook(hook_c, event)
-    assert "echo" not in agent.tool_registry.registry
-
-
 async def test_mcp_shared_client_in_two_agents(monkeypatch: pytest.MonkeyPatch):
     """Agents that share one client each keep its tools across the other's refresh."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: True)
     a = TemporalMCPClient("a")
     first = TemporalAgent(model="m", tools=[a])
     second = TemporalAgent(model="m", tools=[a])
@@ -481,7 +456,6 @@ async def test_mcp_refused_listing_registers_nothing(
     monkeypatch: pytest.MonkeyPatch, cache_tools: bool
 ):
     """A name Strands refuses mid-listing undoes the whole listing, so it can recover."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: True)
     h = TemporalMCPClient("h")
     n = TemporalMCPClient("n", cache_tools=cache_tools)
     agent = TemporalAgent(model="m", tools=[h, n])
@@ -506,29 +480,6 @@ async def test_mcp_refused_listing_registers_nothing(
         assert agent.tool_registry.registry["safe"]._server == "n"  # type: ignore[attr-defined]
 
 
-async def test_mcp_old_run_keeps_tools_before_a_refused_name(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """An old run keeps what registered before Strands refused a name, as before."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: False)
-    h = TemporalMCPClient("h")
-    n = TemporalMCPClient("n", cache_tools=True)
-    agent = TemporalAgent(model="m", tools=[h, n])
-    event = SimpleNamespace(agent=agent)
-    hook_h = agent._make_mcp_refresh_hook(h)
-    hook_n = agent._make_mcp_refresh_hook(n)
-    monkeypatch.setattr(h, "_refresh", _listing(h, "foo-bar"))
-    monkeypatch.setattr(n, "_refresh", _listing(n, "safe", "foo_bar"))
-
-    await _run_hook(hook_h, event)
-    with pytest.raises(ValueError, match="'foo_bar' already exists as 'foo-bar'"):
-        await _run_hook(hook_n, event)
-    assert sorted(agent.tool_registry.registry) == ["foo-bar", "safe"]
-    # cache_tools=True: the listing counts as fetched, so the next turn lists nothing.
-    await _run_hook(hook_n, event)
-    assert sorted(agent.tool_registry.registry) == ["foo-bar", "safe"]
-
-
 @tool(name="echo")
 def _local_echo(message: str) -> str:
     """Return LOCAL:<message>."""
@@ -537,7 +488,6 @@ def _local_echo(message: str) -> str:
 
 async def test_mcp_shared_cached_client_keeps_refusing(monkeypatch: pytest.MonkeyPatch):
     """A refusal stays with the agent that refused; the other keeps what it accepted."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: True)
     shared = TemporalMCPClient("s", cache_tools=True)
     first = TemporalAgent(model="m", tools=[_local_echo, shared])
     second = TemporalAgent(model="m", tools=[shared])
@@ -593,7 +543,6 @@ async def test_mcp_name_moves_between_servers(
     monkeypatch: pytest.MonkeyPatch, order: str
 ):
     """A name one server drops and another adds in the same turn moves, in either order."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: True)
     a = TemporalMCPClient("a")
     b = TemporalMCPClient("b")
     providers = [a, b] if order == "ab" else [b, a]
@@ -629,7 +578,6 @@ async def test_mcp_name_moves_between_servers(
 
 async def test_mcp_failed_listing_lists_again(monkeypatch: pytest.MonkeyPatch):
     """A failed listing of a later server leaves the earlier listing unaccepted."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: True)
     a = TemporalMCPClient("a", cache_tools=True)
     b = TemporalMCPClient("b")
     agent = TemporalAgent(model="m", tools=[a, b])
@@ -654,21 +602,3 @@ async def test_mcp_failed_listing_lists_again(monkeypatch: pytest.MonkeyPatch):
     await _run_hook(hook_b, event)
     assert sorted(agent.tool_registry.registry) == ["echo", "other"]
     assert agent.tool_registry.registry["echo"]._server == "a"  # type: ignore[attr-defined]
-
-
-async def test_mcp_old_run_keeps_moving_names_as_before(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """An old run keeps the earlier result when a name moves: a replaces, b removes it."""
-    monkeypatch.setattr(workflow, "patched", lambda _id: False)
-    a = TemporalMCPClient("a")
-    b = TemporalMCPClient("b")
-    agent = TemporalAgent(model="m", tools=[a, b])
-    event = SimpleNamespace(agent=agent)
-    hooks = [agent._make_mcp_refresh_hook(p) for p in (a, b)]
-    for a_names, b_names in ((("safe",), ("echo",)), (("safe", "echo"), ("other",))):
-        monkeypatch.setattr(a, "_refresh", _listing(a, *a_names))
-        monkeypatch.setattr(b, "_refresh", _listing(b, *b_names))
-        for hook in hooks:
-            await _run_hook(hook, event)
-    assert sorted(agent.tool_registry.registry) == ["other", "safe"]
