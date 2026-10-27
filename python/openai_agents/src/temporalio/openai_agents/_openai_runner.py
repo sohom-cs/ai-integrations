@@ -31,8 +31,8 @@ from temporalio.openai_agents._errors import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
-    _TemporalModelProvider,
     _current_run_model_settings,
+    _TemporalModelProvider,
     capture_scope,
     install_model_provider,
 )
