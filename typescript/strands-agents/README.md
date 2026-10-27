@@ -91,7 +91,7 @@ new StrandsPlugin({
 
 Each `TemporalAgent` carries its own activity options (timeouts, retry policy, task queue, streaming topic) and dispatches to the shared model activity, which resolves the model name against the registered factories at runtime. A name not present in `models` throws inside the activity.
 
-The plugin's activities are named `invokeModel`, `invokeModelStreaming`, and `{name}-listTools` and `{name}-callTool` for each MCP client. If the worker already has a different activity with one of these names, creating the worker fails with `Duplicate registration of Activity '<name>'`; rename your activity, or run the other integration on its own worker.
+The plugin's activities are named `invokeModel`, `invokeModelStreaming`, and `{name}-listTools` and `{name}-callTool` for each MCP client. If the worker already has a different activity with one of these names (your own activity, another integration's activity, or one from a second `StrandsPlugin` with different options), creating the worker fails with `Duplicate registration of Activity '<name>'`. Rename your activity, run the other integration on its own worker, or put every model and MCP client in one `StrandsPlugin`. The same instance on the `NativeConnection` and the worker, or two instances built from the same options object, still work.
 
 ## Retries
 
