@@ -77,8 +77,13 @@ from openai.types.shared import Reasoning
 from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
-from temporalio import activity, workflow
-from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
+from temporalio import activity, nexus, workflow
+from temporalio.client import (
+    Client,
+    WorkflowExecutionStatus,
+    WorkflowFailureError,
+    WorkflowHandle,
+)
 from temporalio.common import RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import (
@@ -352,6 +357,49 @@ class NexusToolsWorkflow:
         return result.final_output
 
 
+@nexusrpc.service
+class HeldService:
+    hold: nexusrpc.Operation[str, str]
+
+
+@workflow.defn
+class HeldWorkflow:
+    """Backs the held operation and runs until it is cancelled."""
+
+    @workflow.run
+    async def run(self, name: str) -> str:
+        await workflow.wait_condition(lambda: False)
+        return name
+
+
+@nexusrpc.handler.service_handler(service=HeldService)
+class HeldServiceHandler:
+    @nexus.workflow_run_operation
+    async def hold(
+        self, ctx: nexus.WorkflowRunOperationContext, name: str
+    ) -> nexus.WorkflowHandle[str]:
+        return await ctx.start_workflow(HeldWorkflow.run, name, id=name)
+
+
+@workflow.defn
+class NexusToolCancelWorkflow:
+    @workflow.run
+    async def run(self, question: str) -> str:
+        agent = Agent[str](
+            name="Nexus Tool Cancel Workflow",
+            instructions="You are a helpful agent.",
+            tools=[
+                openai_agents.workflow.nexus_operation_as_tool(
+                    HeldService.hold,
+                    service=HeldService,
+                    endpoint=make_nexus_endpoint_name(workflow.info().task_queue),
+                ),
+            ],
+        )
+        result = await Runner.run(starting_agent=agent, input=question)
+        return result.final_output
+
+
 async def test_tool_workflow(client: Client):
     async with AgentEnvironment(
         model=weather_mock_model(),
@@ -562,6 +610,73 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+
+
+@pytest.mark.requires_local_server
+async def test_nexus_tool_cancel_workflow(client: Client, env: WorkflowEnvironment):
+    if env.supports_time_skipping:
+        pytest.skip("Nexus tests don't work with time-skipping server")
+
+    held_id = f"held-{uuid.uuid4()}"
+    async with AgentEnvironment(
+        model=TestModel.returning_responses(
+            [ResponseBuilders.tool_call(json.dumps({"input": held_id}), "hold")]
+        ),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
+    ) as agent_env:
+        client = agent_env.applied_on_client(client)
+
+        async with new_worker(
+            client,
+            NexusToolCancelWorkflow,
+            HeldWorkflow,
+            nexus_service_handlers=[HeldServiceHandler()],
+        ) as worker:
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+            )
+
+            workflow_handle = await client.start_workflow(
+                NexusToolCancelWorkflow.run,
+                "Hold",
+                id=f"nexus-tool-cancel-workflow-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            held_handle = client.get_workflow_handle(held_id)
+
+            async def operation_started() -> None:
+                events = [e async for e in workflow_handle.fetch_history_events()]
+                started = [
+                    i
+                    for i, e in enumerate(events)
+                    if e.HasField("nexus_operation_started_event_attributes")
+                ]
+                # The tool is waiting on the started operation.
+                assert started and any(
+                    e.HasField("workflow_task_completed_event_attributes")
+                    for e in events[started[0] :]
+                )
+
+            await assert_eventually(operation_started)
+            try:
+                await workflow_handle.cancel()
+                with pytest.raises(WorkflowFailureError) as err:
+                    await workflow_handle.result()
+                assert isinstance(err.value.cause, CancelledError)
+
+                # The agent Workflow closes only once the operation's cancel request is
+                # delivered, as with a direct execute_operation call.
+                assert (await held_handle.describe()).status == (
+                    WorkflowExecutionStatus.CANCELED
+                )
+            finally:
+                if (await held_handle.describe()).status == (
+                    WorkflowExecutionStatus.RUNNING
+                ):
+                    await held_handle.terminate()
 
 
 def research_mock_model():

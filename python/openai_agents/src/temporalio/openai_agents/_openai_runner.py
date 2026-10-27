@@ -1,6 +1,9 @@
+import asyncio
+import contextlib
+import contextvars
 import dataclasses
 import weakref
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Generator
 from typing import Any, Callable
 
 from agents import (
@@ -37,6 +40,44 @@ from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
+
+# Runs that started before the runner waited for its tools' Nexus operations on cancellation
+# closed in the Workflow Task that recorded the cancel request, so they replay without waiting.
+_WAIT_FOR_NEXUS_TOOL_CANCEL_PATCH = "openai_agents.wait-for-nexus-tool-cancel"
+
+# Pending Nexus operations started by tools, one set per active agent run in a Workflow,
+# outermost first. A tool adds its operation to every set, so an outer run also waits for the
+# operations of an agent that runs as a tool.
+_tool_operations: contextvars.ContextVar[tuple[set[asyncio.Future[None]], ...]] = (
+    contextvars.ContextVar("_tool_operations", default=())
+)
+
+
+@contextlib.contextmanager
+def _track_tool_operation() -> Generator[None, None, None]:
+    """Keep a tool's started Nexus operation pending in the runs until the block exits."""
+    runs = _tool_operations.get()
+    done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    for operations in runs:
+        operations.add(done)
+    try:
+        yield
+    finally:
+        done.set_result(None)
+        for operations in runs:
+            operations.discard(done)
+
+
+async def _wait_for_tool_operations(operations: set[asyncio.Future[None]]) -> None:
+    """Wait for the run's pending Nexus operations after it was cancelled.
+
+    The Agents SDK cancels a run's tool tasks and raises without waiting for them. The
+    Workflow would then close in the same Workflow Task, before Temporal delivers the cancel
+    requests of the tools' Nexus operations. Waiting keeps their cancellation type, which
+    is ``WAIT_COMPLETED``, as when Workflow code calls ``execute_operation`` itself.
+    """
+    if operations and workflow.patched(_WAIT_FOR_NEXUS_TOOL_CANCEL_PATCH):
+        await asyncio.wait(list(operations))
 
 
 # Recursively replace models in all agents
@@ -285,6 +326,8 @@ class TemporalOpenAIRunner(AgentRunner):
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
+        operations: set[asyncio.Future[None]] = set()
+        token = _tool_operations.set((*_tool_operations.get(), operations))
         with capture_scope(run_config.model_settings):
             try:
                 return await self._runner.run(
@@ -292,11 +335,16 @@ class TemporalOpenAIRunner(AgentRunner):
                     input=input,
                     **kwargs,
                 )
+            except asyncio.CancelledError:
+                await _wait_for_tool_operations(operations)
+                raise
             except AgentsException as e:
                 # In order for workflow failures to properly fail the workflow, we need to rewrap them in
                 # a Temporal error
                 _reraise_workflow_failure(e)
                 raise e
+            finally:
+                _tool_operations.reset(token)
 
     def run_sync(
         self,
