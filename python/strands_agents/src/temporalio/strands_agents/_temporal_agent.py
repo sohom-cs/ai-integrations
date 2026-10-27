@@ -7,17 +7,12 @@ from strands.hooks import BeforeModelCallEvent, HookCallback
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
 
-from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._temporal_mcp_client import TemporalMCPClient
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
-
-# Runs that started before the plugin read the worker-side model's config keep
-# an empty config, so their history has no config activity.
-_MODEL_CONFIG_PATCH = "strands-model-config"
 
 _SNAPSHOT_DISABLED = (
     "TemporalAgent disables take_snapshot()/load_snapshot(). Temporal "
@@ -153,10 +148,9 @@ class TemporalAgent(Agent):
         before it starts the agent span. Loading here keeps Strands' rejection,
         deduplication and cancellation of overlapping invocations unchanged.
         """
-        if workflow.patched(_MODEL_CONFIG_PATCH):
-            await self._temporal_model._load_config()
-            if self._temporal_model.stateful:
-                self._use_server_side_state()
+        await self._temporal_model._load_config()
+        if self._temporal_model.stateful:
+            self._use_server_side_state()
         return await super()._convert_prompt_to_messages(prompt)
 
     def _use_server_side_state(self) -> None:
