@@ -1,6 +1,7 @@
 """Provides support for integration with OpenAI Agents SDK tracing across workflows"""
 
 import uuid
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any, cast
 
@@ -82,10 +83,12 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self,
         impl: SynchronousMultiTracingProcessor,
         start_spans_in_replay: bool,
+        tracing_disabled: Callable[[], bool],
     ):
         super().__init__()
         self._impl = impl
         self._emit_spans_in_replay = start_spans_in_replay
+        self._tracing_disabled = tracing_disabled
 
     def add_tracing_processor(self, tracing_processor: TracingProcessor):
         self._impl.add_tracing_processor(tracing_processor)
@@ -94,6 +97,8 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.set_processors(processors)
 
     def on_trace_start(self, trace: Trace) -> None:
+        if self._tracing_disabled():
+            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -102,6 +107,8 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.on_trace_start(trace)
 
     def on_trace_end(self, trace: Trace) -> None:
+        if self._tracing_disabled():
+            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -110,6 +117,8 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.on_trace_end(trace)
 
     def on_span_start(self, span: Span[Any]) -> None:
+        if self._tracing_disabled():
+            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -117,6 +126,8 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.on_span_start(span)
 
     def on_span_end(self, span: Span[Any]) -> None:
+        if self._tracing_disabled():
+            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -159,7 +170,16 @@ class TemporalTraceProvider(DefaultTraceProvider):
         self._multi_processor = _TemporalTracingProcessor(
             self._original_provider._multi_processor,
             start_spans_in_replay,
+            self._original_provider_disabled,
         )
+
+    def _original_provider_disabled(self) -> bool:
+        # set_tracing_disabled() before the Worker started set the flag on the original
+        # provider. Honor it by not sending to the processors, so Workflow code still gets
+        # the same trace and span IDs. A call made while this provider is installed wins.
+        if self._manual_disabled is not None:
+            return False
+        return bool(getattr(self._original_provider, "_disabled", False))
 
     def time_iso(self) -> str:
         """Return the current deterministic time in ISO 8601 format."""

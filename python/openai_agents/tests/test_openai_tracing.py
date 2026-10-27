@@ -292,6 +292,33 @@ async def test_tracing(client: Client):
         )
 
 
+async def test_tracing_disabled_before_worker(client: Client):
+    provider = get_trace_provider()
+    processor = MemoryTracingProcessor()
+    processor.trace_events.clear()
+    processor.span_events.clear()
+    provider.set_processors([processor])
+    provider.set_disabled(True)
+    try:
+        async with AgentEnvironment(model=research_mock_model()) as env:
+            client = env.applied_on_client(client)
+            async with new_worker(client, ResearchWorkflow) as worker:
+                await client.execute_workflow(
+                    ResearchWorkflow.run,
+                    "Caribbean vacation spots in April",
+                    id=f"research-workflow-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=120),
+                )
+        assert processor.trace_events == []
+        assert processor.span_events == []
+    finally:
+        provider.set_disabled(False)
+        provider.set_processors([])
+        processor.trace_events.clear()
+        processor.span_events.clear()
+
+
 @activity.defn
 async def lookup_account(account_id: str) -> str:
     return f"account {account_id}"
