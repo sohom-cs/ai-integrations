@@ -125,10 +125,10 @@ test('A Workflow module with ES module imports loads with one copy of @openai/ag
   t.is(result, 'ESM module response');
 });
 
-test('A Workflow module with ES module imports keeps its bundle when it already loads', async (t) => {
+test('A Workflow module with ES module imports bundles one copy of @openai/agents-core with async chunks off', async (t) => {
   const plugin = new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) });
-  // These configs avoid the async chunk, so their bundles load with both builds of
-  // @openai/agents-core. Open runs on them must replay with the same code.
+  // These configs avoid the async chunk, so a bundle with both builds of @openai/agents-core would
+  // still load, and the plugin's instanceof checks would miss objects from one of them.
   const setups: Record<string, NonNullable<Parameters<typeof bundleWorkflowCode>[0]['webpackConfigHook']>> = {
     'output.asyncChunks: false': (config) => ({ ...config, output: { ...config.output, asyncChunks: false } }),
     "dynamicImportMode: 'eager'": (config) => ({
@@ -142,7 +142,8 @@ test('A Workflow module with ES module imports keeps its bundle when it already 
       plugins: [plugin],
       webpackConfigHook,
     });
-    t.regex(code, /@openai[\\/]agents-core[\\/]dist[\\/][^"'\s]*\.mjs/, `${name}: no module from the ES module build`);
+    const esModuleBuild = new Set(code.match(/@openai[\\/]agents-core[\\/]dist[\\/][^"'\s]*\.mjs/g));
+    t.deepEqual([...esModuleBuild].slice(0, 3), [], `${name}: ${esModuleBuild.size} modules from the ES module build`);
   }
 });
 
