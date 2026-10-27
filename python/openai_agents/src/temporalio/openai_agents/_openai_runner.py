@@ -32,6 +32,7 @@ from temporalio.openai_agents._errors import (
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
     _TemporalModelProvider,
+    _current_run_model_settings,
     capture_scope,
     install_model_provider,
 )
@@ -109,6 +110,7 @@ def _convert_agent(
         model_name=name,
         model_params=model_params,
         agent=agent,
+        current_run_model_settings=_current_run_model_settings.get,
     )
     new_agent.handoffs = new_handoffs
     new_agent.tools = [
@@ -214,7 +216,7 @@ class TemporalOpenAIRunner(AgentRunner):
         self,
         starting_agent: Agent[TContext],
         kwargs: RunOptions[TContext],
-    ) -> Agent[Any]:
+    ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
         for t in starting_agent.tools:
             if callable(t):
@@ -316,7 +318,7 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None)
+        return _convert_agent(self.model_params, starting_agent, None), run_config
 
     async def run(
         self,
@@ -332,9 +334,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        with capture_scope():
+        with capture_scope(run_config.model_settings):
             try:
                 return await self._runner.run(
                     starting_agent=converted_agent,
@@ -404,13 +406,16 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        streamed_result = self._runner.run_streamed(
-            starting_agent=converted_agent,
-            input=input,
-            **kwargs,
-        )
+        # The streaming loop runs in a task created inside run_streamed, which copies
+        # this context, so the scope only needs to cover the call itself.
+        with capture_scope(run_config.model_settings):
+            streamed_result = self._runner.run_streamed(
+                starting_agent=converted_agent,
+                input=input,
+                **kwargs,
+            )
 
         # Mirror the AgentsException -> AgentsWorkflowError rewrap done
         # in run() above. The streaming runner attaches the actual run
