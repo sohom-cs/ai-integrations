@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import timedelta
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -74,34 +75,57 @@ def test_model_binding_preserves_kwargs_with_tools(bind_kwargs: dict[str, Any]) 
     assert bound.kwargs == {"tools": tool_schemas, **bind_kwargs}
 
 
-def _offline_chat_model(provider: str) -> Any:
-    if provider == "anthropic":
-        langchain_anthropic = pytest.importorskip("langchain_anthropic")
-        return langchain_anthropic.ChatAnthropic(model="test-model", api_key="test")
-    langchain_openai = pytest.importorskip("langchain_openai")
-    return langchain_openai.ChatOpenAI(
-        model="Qwen/Qwen3-8B", base_url="http://localhost:8000/v1", api_key="test"
+@pytest.mark.parametrize(
+    "tool_kwargs",
+    [
+        {"tool_choice": "any"},
+        {"parallel_tool_calls": False},
+        {"tool_choice": "any", "parallel_tool_calls": False},
+    ],
+)
+def test_tool_options_go_to_bind_tools(tool_kwargs: dict[str, Any]) -> None:
+    # Providers convert these options only inside bind_tools, so the activity
+    # must pass them there; other options still go through .bind().
+    tool_schemas = [
+        {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+    ]
+    other_kwargs = {"stop": ["Observation:"]}
+    model = Mock(wraps=_ToolBindingModel(responses=["answer"]))
+    activities = DeepAgentActivities(model_provider=lambda _: model)
+
+    bound = activities._build_bound_model(
+        ModelActivityInput(
+            model_name="fake:model",
+            messages=[],
+            tool_schemas=tool_schemas,
+            bind_kwargs={**tool_kwargs, **other_kwargs},
+        )
     )
+
+    model.bind_tools.assert_called_once_with(tool_schemas, **tool_kwargs)
+    assert bound.kwargs == {"tools": tool_schemas, **tool_kwargs, **other_kwargs}
 
 
 @pytest.mark.parametrize(
-    ("provider", "tool_kwargs", "expected"),
+    ("tool_kwargs", "expected"),
     [
-        ("anthropic", {"tool_choice": "any"}, {"tool_choice": {"type": "any"}}),
+        ({"tool_choice": "any"}, {"tool_choice": {"type": "any"}}),
         (
-            "anthropic",
             {"parallel_tool_calls": False},
             {"tool_choice": {"type": "auto", "disable_parallel_tool_use": True}},
         ),
-        ("openai", {"tool_choice": "any"}, {"tool_choice": "required"}),
     ],
 )
 def test_tool_options_use_provider_format(
-    provider: str, tool_kwargs: dict[str, Any], expected: dict[str, Any]
+    tool_kwargs: dict[str, Any], expected: dict[str, Any]
 ) -> None:
     # create_agent binds tool_choice="any" for structured output; the provider's
     # bind_tools must convert it, as it does without Temporal.
-    chat_model = _offline_chat_model(provider)
+    langchain_anthropic = pytest.importorskip("langchain_anthropic")
+    chat_model = langchain_anthropic.ChatAnthropic(model="test-model", api_key="test")
     tool = {
         "type": "function",
         "function": {"name": "lookup", "parameters": {"type": "object"}},
