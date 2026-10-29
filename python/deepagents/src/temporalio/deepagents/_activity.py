@@ -256,6 +256,12 @@ class _BackendFactory:
         return self._factory()
 
 
+# Binding options that a provider's ``bind_tools`` converts to its own format
+# (Anthropic turns ``"any"`` into ``{"type": "any"}``, OpenAI into
+# ``"required"``). Passing them to ``.bind()`` instead skips that conversion.
+_TOOL_BIND_KWARGS = ("tool_choice", "parallel_tool_calls")
+
+
 def _default_model_provider(model_name: str) -> Any:
     """Build a chat model from a name string with LLM-SDK retries disabled.
 
@@ -295,10 +301,14 @@ class DeepAgentActivities:
 
     def _build_bound_model(self, input: ModelActivityInput) -> Any:
         model = self._model_provider(input.model_name)
+        bind_kwargs = dict(input.bind_kwargs)
         if input.tool_schemas:
-            model = model.bind_tools(input.tool_schemas)
-        if input.bind_kwargs:
-            model = model.bind(**input.bind_kwargs)
+            tool_kwargs = {
+                k: bind_kwargs.pop(k) for k in _TOOL_BIND_KWARGS if k in bind_kwargs
+            }
+            model = model.bind_tools(input.tool_schemas, **tool_kwargs)
+        if bind_kwargs:
+            model = model.bind(**bind_kwargs)
         return model
 
     @activity.defn(name=INVOKE_MODEL)
