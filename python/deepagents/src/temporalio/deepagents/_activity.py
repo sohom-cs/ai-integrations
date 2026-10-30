@@ -43,6 +43,9 @@ INVOKE_MODEL_STREAMING = "deepagents.invoke_model_streaming"
 INVOKE_TOOL = "deepagents.invoke_tool"
 BACKEND_OP = "deepagents.backend_op"
 
+CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
+"""``ApplicationError.type`` of a model call the provider rejected as too long."""
+
 
 # ---------------------------------------------------------------------------
 # Boundary payloads
@@ -215,6 +218,23 @@ def _translate_api_error(exc: Exception) -> ApplicationError | None:
     )
 
 
+def _context_overflow_error(exc: Exception) -> ApplicationError | None:
+    """Mark a provider's context-window overflow so the workflow can recover.
+
+    Deep Agents' summarization middleware summarizes older messages and retries
+    when a model call fails with an overflow it recognizes. The provider's
+    exception is only available here, so classify it with the middleware's own
+    check and give the failure a type the workflow side rebuilds the overflow
+    from. Retrying the same request cannot succeed, so it is non-retryable.
+    """
+    summarization = importlib.import_module("deepagents.middleware.summarization")
+    if not summarization._is_context_overflow(exc):
+        return None
+    return ApplicationError(
+        str(exc), type=CONTEXT_OVERFLOW_ERROR_TYPE, non_retryable=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # The activities
 # ---------------------------------------------------------------------------
@@ -327,6 +347,9 @@ class DeepAgentActivities:
         try:
             message = await model.ainvoke(messages, config=config)
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
@@ -369,6 +392,9 @@ class DeepAgentActivities:
                         topic.publish(_serde.dump_object(chunk))
                     final = chunk if final is None else final + chunk
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
