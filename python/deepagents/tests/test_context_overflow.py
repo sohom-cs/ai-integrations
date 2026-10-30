@@ -11,6 +11,7 @@ does without Temporal.
 
 from __future__ import annotations
 
+import importlib
 import sys
 import uuid
 from datetime import timedelta
@@ -43,7 +44,7 @@ with workflow.unsafe.imports_passed_through():
     from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
 
-    from temporalio.deepagents import DeepAgentsPlugin
+    from temporalio.deepagents import DeepAgentsPlugin, _activity
     from temporalio.deepagents._activity import DeepAgentActivities, ModelActivityInput
     from temporalio.deepagents._serde import dump_messages
 
@@ -139,6 +140,41 @@ class OverflowWorkflow:
 # -- worker side (no server) --------------------------------------------------
 
 
+@pytest.fixture(params=["installed", "0.7.0-0.7.13"])
+def deepagents_release(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run with the installed Deep Agents, then as on 0.7.0 to 0.7.13.
+
+    The plugin allows ``deepagents>=0.7``; before 0.7.14 the summarization
+    middleware has no ``_is_context_overflow``.
+    """
+    if request.param != "installed":
+        summarization = importlib.import_module("deepagents.middleware.summarization")
+        monkeypatch.delattr(summarization, "_is_context_overflow", raising=False)
+
+
+class _StatusError(Exception):
+    def __init__(self, status_code: int | None, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "overflow"),
+    [
+        (413, "Request too large: input tokens exceed the configured limit", True),
+        (422, "Error code: 422 - context_length_exceeded", True),
+        (400, "Error code: 400 - invalid tool schema", False),
+        (500, "maximum context length is 4096 tokens", False),
+        (None, "prompt is too long", False),
+    ],
+)
+def test_overflow_check(status: int | None, message: str, overflow: bool) -> None:
+    assert _activity._is_context_overflow(_StatusError(status, message)) is overflow
+
+
+@pytest.mark.usefixtures("deepagents_release")
 @pytest.mark.parametrize("provider", sorted(OVERFLOWS))
 async def test_model_activity_marks_provider_overflow(provider: str) -> None:
     activities = DeepAgentActivities(
@@ -153,6 +189,7 @@ async def test_model_activity_marks_provider_overflow(provider: str) -> None:
     assert raised.value.non_retryable
 
 
+@pytest.mark.usefixtures("deepagents_release")
 async def test_other_bad_request_keeps_its_type() -> None:
     class BadRequest(Exception):
         status_code = 400
